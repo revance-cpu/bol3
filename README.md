@@ -63,3 +63,28 @@ http://127.0.0.1:3002/
 ## Important Vercel note
 
 BO3.gg is Nuxt-based. Normal server-side HTTP clients may receive only an empty Nuxt client shell with 0 visible chars and 0 anchors. This build tries desktop, Googlebot, Bingbot, and Facebook crawler-style headers before returning. If `/v2/debug/fetch` still says `render_mode: nuxt-client-shell`, BO3 did not return prerendered HTML to Vercel and the next step is to use BO3's internal JSON endpoint or a browser-rendered source.
+
+
+## v0.4.0 summary details patch
+
+`/v2/match/details` now returns verifier-focused data only:
+
+```json
+{
+  "match": {
+    "team1": "Gentle Mates",
+    "team2": "Nemesis",
+    "score1": 0,
+    "score2": 2,
+    "winner": "Nemesis",
+    "bo": "bo3"
+  },
+  "maps": [
+    {"game": 1, "map": "Nuke", "score1": 6, "score2": 13, "winner": "Nemesis"},
+    {"game": 2, "map": "Inferno", "score1": 8, "score2": 13, "winner": "Nemesis"}
+  ]
+}
+```
+
+It no longer returns `streams`, `lineups`, or `picks_bans` in the details response.
+The finished list also filters out future/upcoming rows that BO3 sometimes mixes into `/matches/finished`.

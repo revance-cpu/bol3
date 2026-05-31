@@ -131,6 +131,7 @@ HEADER_PROFILES = [
 ]
 
 MAP_NAMES = (
+    # CS2
     "Dust II",
     "Dust 2",
     "Mirage",
@@ -143,6 +144,19 @@ MAP_NAMES = (
     "Overpass",
     "Cache",
     "Cobblestone",
+    # Valorant
+    "Abyss",
+    "Ascent",
+    "Bind",
+    "Breeze",
+    "Corrode",
+    "Fracture",
+    "Haven",
+    "Icebox",
+    "Lotus",
+    "Pearl",
+    "Split",
+    "Sunset",
 )
 
 NOISE_LINES = {
@@ -774,6 +788,18 @@ def parse_match_list(raw_html: str, status_hint: str) -> Dict[str, Any]:
         segments = parse_match_list_from_text(raw_html, status_hint)
     if not segments:
         segments = parse_match_list_from_visible_lines(raw_html, status_hint)
+
+    # BO3 sometimes mixes future/upcoming rows into the finished page.
+    # For verifier use, finished/results must only return rows with a real score.
+    if status_hint == "finished":
+        segments = [
+            item
+            for item in segments
+            if item.get("score1") is not None
+            and item.get("score2") is not None
+            and bool(item.get("winner"))
+        ]
+
     return {"status": 200, "segments": segments, "count": len(segments)}
 
 
@@ -820,69 +846,146 @@ def find_line_index(lines: List[str], target: str, start: int = 0, end: Optional
     return None
 
 
+def is_score_line(line: str) -> bool:
+    return parse_score(line) is not None
+
+
+def is_int_line(line: str) -> bool:
+    return bool(re.fullmatch(r"\d+", collapse_ws(line)))
+
+
+def is_section_stop(line: str) -> bool:
+    line = collapse_ws(line)
+    return bool(
+        re.search(
+            r"^(Full stats|Overview|Performance|Aim|Grenades|Devices|Economy|Score predict|Stream|Analytics Insights|Team Form|Teams advantage|Lineups|Picks\s*&\s*bans|Historical|Head to head|Comments|Latest top news)",
+            line,
+            flags=re.I,
+        )
+        or re.search(r"\bScoreboard$", line, flags=re.I)
+    )
+
+
+def detail_top_lines(lines: List[str], max_lines: int = 120) -> List[str]:
+    """Return only the match header block, excluding predictions/stats/noise."""
+    out: List[str] = []
+    title_seen = False
+    for line in lines[:max_lines]:
+        if " vs " in line:
+            title_seen = True
+        if title_seen and is_section_stop(line):
+            break
+        # Ignore global nav/header before the H1 title if present.
+        if not title_seen and line.lower() in {"cs2", "valorant", "r6s", "dota 2", "lol", "mlbb", "sign in"}:
+            continue
+        out.append(line)
+    return out
+
+
+def lines_between_markers(lines: List[str], start_regex: str, stop_regex: str) -> List[str]:
+    start = None
+    for i, line in enumerate(lines):
+        if re.search(start_regex, line, flags=re.I):
+            start = i + 1
+            break
+    if start is None:
+        return []
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if re.search(stop_regex, lines[j], flags=re.I):
+            end = j
+            break
+    return lines[start:end]
+
+
+def parse_bo_from_lines(lines: List[str]) -> str:
+    for line in lines[:120]:
+        m = re.search(r"\bBo([1357])\b", line, flags=re.I)
+        if m:
+            return "bo" + m.group(1)
+    return ""
+
+
+def infer_bo_from_series(score1: Optional[int], score2: Optional[int], maps: List[Dict[str, Any]]) -> str:
+    if score1 is not None and score2 is not None:
+        wins_needed = max(score1, score2)
+        if wins_needed >= 3:
+            return "bo5"
+        if wins_needed == 2:
+            return "bo3"
+        if wins_needed == 1:
+            return "bo1"
+    if len(maps) >= 4:
+        return "bo5"
+    if len(maps) >= 2:
+        return "bo3"
+    if len(maps) == 1:
+        return "bo1"
+    return ""
+
+
+def make_series(team1: str, team2: str, score1: Optional[int], score2: Optional[int]) -> Dict[str, Any]:
+    winner = ""
+    if score1 is not None and score2 is not None and team1 and team2:
+        winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+    return {"score1": score1, "score2": score2, "winner": winner}
+
+
 def parse_series_score(lines: List[str], visible: str, team1: str, team2: str) -> Dict[str, Any]:
-    flat = " ".join(lines[:120])
+    """Parse only the match header score, never odds/Score predict/history."""
+    top = detail_top_lines(lines)
+    top_flat = " ".join(top[:80])
+
     if team1 and team2:
         pattern = re.compile(
             re.escape(team1) + r"\s+(\d+)\s*-\s*(\d+)\s+" + re.escape(team2),
             flags=re.I | re.S,
         )
-        m = pattern.search(flat)
+        m = pattern.search(top_flat)
         if m:
-            s1 = int(m.group(1))
-            s2 = int(m.group(2))
-            winner = team1 if s1 > s2 else team2 if s2 > s1 else "draw"
-            return {"score1": s1, "score2": s2, "winner": winner}
+            return make_series(team1, team2, int(m.group(1)), int(m.group(2)))
 
         pattern2 = re.compile(
             re.escape(team2) + r"\s+(\d+)\s*-\s*(\d+)\s+" + re.escape(team1),
             flags=re.I | re.S,
         )
-        m2 = pattern2.search(flat)
+        m2 = pattern2.search(top_flat)
         if m2:
-            s2 = int(m2.group(1))
-            s1 = int(m2.group(2))
-            winner = team1 if s1 > s2 else team2 if s2 > s1 else "draw"
-            return {"score1": s1, "score2": s2, "winner": winner}
+            return make_series(team1, team2, int(m2.group(2)), int(m2.group(1)))
 
-    # BO3 detail pages commonly render top box as:
-    # Ended / 1 / Team A / 0 - 2 / Team B / Full stats
-    top_end = len(lines)
-    for marker in ["Full stats", "Overview", "Full match Winner"]:
-        idx = find_line_index(lines, marker, 0, 80)
-        if idx is not None:
-            top_end = min(top_end, idx)
-
-    t1_idx = find_line_index(lines, team1, 0, top_end) if team1 else None
-    t2_idx = find_line_index(lines, team2, 0, top_end) if team2 else None
+    # Common finished detail header:
+    # Ended / seed-or-rank / Team A / 0 - 2 / Team B / Full stats
+    t1_idx = find_line_index(top, team1, 0, len(top)) if team1 else None
+    t2_idx = find_line_index(top, team2, 0, len(top)) if team2 else None
     if t1_idx is not None and t2_idx is not None:
         lo = min(t1_idx, t2_idx)
         hi = max(t1_idx, t2_idx)
         for i in range(lo, hi + 1):
-            score = parse_score(lines[i])
+            score = parse_score(top[i])
             if score:
                 a, b = score
-                # Assign score according to line order.
                 if t1_idx < t2_idx:
-                    s1, s2 = a, b
-                else:
-                    s2, s1 = a, b
-                winner = team1 if s1 > s2 else team2 if s2 > s1 else "draw"
-                return {"score1": s1, "score2": s2, "winner": winner}
+                    return make_series(team1, team2, a, b)
+                return make_series(team1, team2, b, a)
 
-    # Last fallback: first plausible score in top box, names from title/slug.
-    for i, line in enumerate(lines[:top_end]):
+    # Fallback: first score-like line in the header only. This deliberately
+    # excludes Score predict, odds, Team Form, H2H, and historical stats.
+    for line in top[:80]:
         score = parse_score(line)
         if score:
-            s1, s2 = score
-            winner = team1 if team1 and s1 > s2 else team2 if team2 and s2 > s1 else "draw" if s1 == s2 else ""
-            return {"score1": s1, "score2": s2, "winner": winner}
+            return make_series(team1, team2, score[0], score[1])
 
     return {"score1": None, "score2": None, "winner": ""}
 
-
 def canonical_map_name(value: str) -> str:
-    key = norm_key(value)
+    raw = collapse_ws(value)
+    # BO3 labels unknown/decider maps as Map 3 / Map 5 on live pages.
+    if re.fullmatch(r"(?:Map|Game)\s*\d+", raw, flags=re.I):
+        return raw.title().replace("Game", "Game")
+
+    # Some live tabs come through as "Mirage LIVE".
+    raw = re.sub(r"\bLIVE\b", "", raw, flags=re.I).strip()
+    key = norm_key(raw)
     for name in MAP_NAMES:
         if norm_key(name) == key:
             return "Dust II" if name == "Dust 2" else name
@@ -890,44 +993,90 @@ def canonical_map_name(value: str) -> str:
 
 
 def parse_map_scores(lines: List[str], visible: str, team1: str, team2: str) -> List[Dict[str, Any]]:
+    """Parse the actual played map/game rows only.
+
+    The old parser looked too far past the map tabs and accidentally treated
+    BO3's "Score predict" odds like a real map result. This version only reads
+    the Full match Winner/map-tab area and stops before Score predict, streams,
+    scoreboards, form tables, lineups, picks/bans, and H2H.
+    """
+    stop_re = (
+        r"^(?:Score predict|Stream|Analytics Insights|Team Form|Teams advantage|Lineups|"
+        r"Picks\s*&\s*bans|Historical|Head to head|Comments|Latest top news|Overview|"
+        r"Performance|Aim|Grenades|Devices|Economy)|\bScoreboard$"
+    )
+
+    section = lines_between_markers(lines, r"^Full match Winner$", stop_re)
+
+    # Live/upcoming pages often have map tabs but no "Full match Winner" marker.
+    # Use the block after the header and before Score predict/Stream/etc.
+    if not section:
+        top = detail_top_lines(lines, max_lines=160)
+        section = []
+        started = False
+        for line in top:
+            if canonical_map_name(line):
+                started = True
+            if started:
+                if is_section_stop(line):
+                    break
+                section.append(line)
+
     maps: List[Dict[str, Any]] = []
-    text = " ".join(lines)
-    map_alt = "|".join(re.escape(x) for x in MAP_NAMES)
-
-    # Inline form: Nuke 6 - 13
-    for m in re.finditer(r"\b(" + map_alt + r")\s+(\d+)\s*-\s*(\d+)\b", text, flags=re.I):
-        map_name = canonical_map_name(m.group(1)) or collapse_ws(m.group(1))
-        s1 = int(m.group(2))
-        s2 = int(m.group(3))
-        winner = team1 if team1 and s1 > s2 else team2 if team2 and s2 > s1 else "draw"
-        maps.append({"map": map_name, "score1": s1, "score2": s2, "winner": winner})
-
-    # Split-line form:
-    # Full match Winner / Nuke / 6 - 13 / Inferno / 8 - 13 / Scoreboard
-    for i, line in enumerate(lines):
-        map_name = canonical_map_name(line)
+    i = 0
+    while i < len(section):
+        map_name = canonical_map_name(section[i])
         if not map_name:
+            i += 1
             continue
-        # Ignore historical map winrate sections by requiring a score nearby.
-        for j in range(i + 1, min(i + 5, len(lines))):
-            score = parse_score(lines[j])
-            if not score:
-                continue
-            s1, s2 = score
-            winner = team1 if team1 and s1 > s2 else team2 if team2 and s2 > s1 else "draw"
-            maps.append({"map": map_name, "score1": s1, "score2": s2, "winner": winner})
-            break
 
-    # Remove duplicates while preserving order.
+        score1: Optional[int] = None
+        score2: Optional[int] = None
+        # The score is usually the next line. Search a tiny window, but stop if
+        # another map/tab or a new section starts first.
+        for j in range(i + 1, min(i + 4, len(section))):
+            if is_section_stop(section[j]) or canonical_map_name(section[j]):
+                break
+            score = parse_score(section[j])
+            if score:
+                score1, score2 = score
+                break
+
+        winner = ""
+        if score1 is not None and score2 is not None and team1 and team2:
+            winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+
+        maps.append(
+            {
+                "game": len(maps) + 1,
+                "map": map_name,
+                "team1": team1,
+                "team2": team2,
+                "score1": score1,
+                "score2": score2,
+                "winner": winner,
+            }
+        )
+        i += 1
+
+    # Remove duplicates while preserving order. Prefer scored rows over null rows.
     deduped: List[Dict[str, Any]] = []
-    seen = set()
+    by_map: Dict[str, int] = {}
     for item in maps:
-        key = (item["map"].lower(), item["score1"], item["score2"])
-        if key not in seen:
+        key = norm_key(item.get("map", "")) or str(item.get("game"))
+        existing_idx = by_map.get(key)
+        if existing_idx is None:
+            by_map[key] = len(deduped)
             deduped.append(item)
-            seen.add(key)
-    return deduped
+            continue
+        existing = deduped[existing_idx]
+        if existing.get("score1") is None and item.get("score1") is not None:
+            item["game"] = existing.get("game", item["game"])
+            deduped[existing_idx] = item
 
+    for idx, item in enumerate(deduped, 1):
+        item["game"] = idx
+    return deduped
 
 def slice_between(lines: List[str], start_regex: str, stop_regex: str) -> List[str]:
     start = None
@@ -1020,34 +1169,105 @@ def parse_match_detail(raw_html: str, source_url: str) -> Dict[str, Any]:
             if useful_team_line(cand) and " vs " not in cand:
                 tournament = cand
 
-    series = parse_series_score(lines, visible, team1, team2)
-    maps = parse_map_scores(lines, visible, team1, team2)
-    picks_bans = parse_picks_bans(lines)
-    streams = parse_streams(lines)
-    lineups = parse_lineups(lines, team1, team2)
     status = status_from_detail_lines(lines)
+    maps = parse_map_scores(lines, visible, team1, team2)
+    series = parse_series_score(lines, visible, team1, team2)
+    bo = parse_bo_from_lines(lines) or infer_bo_from_series(series["score1"], series["score2"], maps)
+
+    match_summary = {
+        "title": title,
+        "url": source_url,
+        "status": status,
+        "tournament": tournament,
+        "bo": bo,
+        "team1": team1,
+        "team2": team2,
+        "score1": series["score1"],
+        "score2": series["score2"],
+        "winner": series["winner"],
+    }
+
+    # Keep the old single-segment shape, but only include verifier-relevant data.
+    segment = dict(match_summary)
+    segment["teams"] = [
+        {"name": team1, "score": series["score1"]},
+        {"name": team2, "score": series["score2"]},
+    ]
+    segment["maps"] = maps
 
     return {
         "status": 200,
-        "segments": [
-            {
-                "title": title,
-                "url": source_url,
-                "status": status,
-                "tournament": tournament,
-                "teams": [
-                    {"name": team1, "score": series["score1"]},
-                    {"name": team2, "score": series["score2"]},
-                ],
-                "winner": series["winner"],
-                "maps": maps,
-                "picks_bans": picks_bans,
-                "streams": streams,
-                "lineups": lineups,
-            }
-        ],
+        "match": match_summary,
+        "maps": maps,
+        "segments": [segment],
     }
 
+
+def merge_detail_with_list_item(data: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    """Use /matches/current or /matches/finished as a safe summary fallback.
+
+    BO3 live detail pages can omit the opposing team's series score in the
+    header, while the list row has it. This prevents Score predict odds from
+    being misread as the actual winner.
+    """
+    if not item:
+        return data
+
+    match = data.get("match") or {}
+    segments = data.get("segments") or []
+    segment = segments[0] if segments else {}
+
+    score1 = item.get("score1")
+    score2 = item.get("score2")
+    has_list_score = score1 is not None and score2 is not None
+
+    if item.get("team1"):
+        match["team1"] = item.get("team1")
+    if item.get("team2"):
+        match["team2"] = item.get("team2")
+    if item.get("status"):
+        match["status"] = item.get("status")
+    if item.get("bo"):
+        match["bo"] = item.get("bo")
+
+    if has_list_score:
+        match["score1"] = score1
+        match["score2"] = score2
+        match["winner"] = item.get("winner", "")
+        if not match.get("bo"):
+            match["bo"] = infer_bo_from_series(score1, score2, data.get("maps") or [])
+
+    # Mirror into the old segment object.
+    for key, value in match.items():
+        segment[key] = value
+    segment["teams"] = [
+        {"name": match.get("team1", ""), "score": match.get("score1")},
+        {"name": match.get("team2", ""), "score": match.get("score2")},
+    ]
+    segment["maps"] = data.get("maps") or []
+
+    data["match"] = match
+    data["segments"] = [segment]
+    return data
+
+
+async def find_match_list_item_for_detail(full_url: str, game: str) -> Dict[str, Any]:
+    target_path = canonical_match_path(urlparse(full_url).path).rstrip("/")
+    candidates = []
+    for q_norm in ("current", "finished"):
+        try:
+            path, hint, ttl = match_list_path(game, q_norm)
+            raw = await fetch_html(path, ttl=ttl)
+            parsed = parse_match_list(raw, hint)
+            candidates.extend(parsed.get("segments") or [])
+        except Exception:
+            continue
+
+    for item in candidates:
+        item_path = canonical_match_path(urlparse(item.get("url", "")).path).rstrip("/")
+        if item_path == target_path:
+            return item
+    return {}
 
 def is_client_shell(raw_html: str) -> bool:
     if not raw_html:
@@ -1140,7 +1360,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.3.0", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.4.0", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -1223,8 +1443,16 @@ async def match_details(
         raise HTTPException(status_code=400, detail="match details URL must be a BO3 match detail URL under /matches/")
 
     raw = await fetch_html(full_url, ttl=60)
+    canonical = game_from_path(urlparse(full_url).path)
     data = parse_match_detail(raw, full_url)
-    data["game"] = game_from_path(urlparse(full_url).path)
+
+    # Detail pages are best for map results. The list page is best for live
+    # series score/winner when the detail page omits a side score.
+    list_item = await find_match_list_item_for_detail(full_url, canonical)
+    if list_item:
+        data = merge_detail_with_list_item(data, list_item)
+
+    data["game"] = canonical
     data["render_mode"] = response_mode(raw)
     return {"status": "success", "data": data}
 
