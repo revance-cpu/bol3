@@ -16,6 +16,8 @@ Examples:
   curl "http://127.0.0.1:3002/v2/match?game=cs2&q=finished"
   curl "http://127.0.0.1:3002/v2/match?game=valorant&q=current"
   curl "http://127.0.0.1:3002/v2/match/all?q=finished"
+  curl "http://127.0.0.1:3002/v2/match/details?game=cs2&q=live&team1=Team%20Nemesis&team2=FOKUS"
+  curl "http://127.0.0.1:3002/v2/match/details?game=cs2&q=finished&search=Nemesis%20FOKUS"
   curl "http://127.0.0.1:3002/v2/match/details?url=https://bo3.gg/matches/gentle-mates-cs-vs-team-nemesis-cs-31-05-2026"
 """
 
@@ -1269,6 +1271,223 @@ async def find_match_list_item_for_detail(full_url: str, game: str) -> Dict[str,
             return item
     return {}
 
+
+# Extra tokens to ignore when comparing BO3 team names against Polymarket names.
+# This makes "Team Nemesis" match "Nemesis", "TEC Esports" match "TEC", etc.
+TEAM_NAME_DROP_WORDS = {
+    "team", "esport", "esports", "gaming", "gg", "cs", "cs2", "csgo",
+    "valorant", "val", "lol", "dota", "dota2", "r6", "r6s", "siege",
+    "mobile", "legends", "mlbb", "club", "clan", "academy",
+}
+
+
+def team_match_key(value: str) -> str:
+    words = re.findall(r"[a-z0-9]+", collapse_ws(value).casefold())
+    kept = [w for w in words if w not in TEAM_NAME_DROP_WORDS]
+    if not kept:
+        kept = words
+    return "".join(kept)
+
+
+def team_names_close(a: str, b: str) -> bool:
+    ka = team_match_key(a)
+    kb = team_match_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    # Allow one side to include a harmless suffix/prefix that the other omits,
+    # but avoid matching tiny tokens like "g" against "g2ares".
+    if min(len(ka), len(kb)) >= 4 and (ka in kb or kb in ka):
+        return True
+    return False
+
+
+def item_matches_team_filters(item: Dict[str, Any], team1: str = "", team2: str = "", search: str = "") -> bool:
+    i1 = item.get("team1", "") or ""
+    i2 = item.get("team2", "") or ""
+    haystack = " ".join([
+        item.get("raw_text", "") or "",
+        i1,
+        i2,
+        item.get("url", "") or "",
+    ]).casefold()
+
+    search = collapse_ws(search or "")
+    if search:
+        # Search is intentionally forgiving: every non-trivial token must appear
+        # somewhere in team names/raw/url after normalization.
+        tokens = [
+            t for t in re.findall(r"[a-z0-9]+", search.casefold())
+            if len(t) >= 2 and t not in TEAM_NAME_DROP_WORDS
+        ]
+        normalized_haystack = norm_key(haystack)
+        if tokens and not all(t in normalized_haystack for t in tokens):
+            return False
+
+    team1 = collapse_ws(team1 or "")
+    team2 = collapse_ws(team2 or "")
+    if team1 and team2:
+        direct = team_names_close(team1, i1) and team_names_close(team2, i2)
+        swapped = team_names_close(team1, i2) and team_names_close(team2, i1)
+        return direct or swapped
+    if team1:
+        return team_names_close(team1, i1) or team_names_close(team1, i2)
+    if team2:
+        return team_names_close(team2, i1) or team_names_close(team2, i2)
+    return True
+
+
+def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    match = dict(data.get("match") or {})
+    maps = list(data.get("maps") or [])
+
+    # Keep map winner labels consistent with the final match team labels.  BO3
+    # live/detail pages can abbreviate team names differently than list rows.
+    team1 = match.get("team1", "") or ""
+    team2 = match.get("team2", "") or ""
+    cleaned_maps: List[Dict[str, Any]] = []
+    for idx, mp in enumerate(maps, 1):
+        score1 = mp.get("score1")
+        score2 = mp.get("score2")
+        winner = ""
+        if score1 is not None and score2 is not None and team1 and team2:
+            winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+        cleaned_maps.append({
+            "game": mp.get("game") or idx,
+            "map": mp.get("map", "") or "",
+            "team1": team1,
+            "team2": team2,
+            "score1": score1,
+            "score2": score2,
+            "winner": winner or mp.get("winner", "") or "",
+        })
+
+    match["map_count"] = len(cleaned_maps)
+    match["map_winners"] = [
+        {"game": mp.get("game"), "map": mp.get("map", ""), "winner": mp.get("winner", "")}
+        for mp in cleaned_maps
+    ]
+
+    out = {
+        "match": match,
+        "maps": cleaned_maps,
+    }
+    if source_row is not None:
+        out["source_row"] = source_row
+    return out
+
+
+async def fetch_compact_detail_for_item(item: Dict[str, Any], game: str) -> Dict[str, Any]:
+    full_url = item.get("url", "") or ""
+    if not full_url:
+        # Fallback when BO3 list rows were parsed without hrefs. No map data is
+        # possible without a detail URL, but the series result is still useful.
+        match_summary = {
+            "title": "%s vs %s" % (item.get("team1", ""), item.get("team2", "")),
+            "url": "",
+            "status": item.get("status", ""),
+            "tournament": "",
+            "bo": item.get("bo", "") or infer_bo_from_series(item.get("score1"), item.get("score2"), []),
+            "team1": item.get("team1", ""),
+            "team2": item.get("team2", ""),
+            "score1": item.get("score1"),
+            "score2": item.get("score2"),
+            "winner": item.get("winner", ""),
+        }
+        return compact_detail_payload({"match": match_summary, "maps": []}, item)
+
+    raw = await fetch_html(full_url, ttl=60)
+    data = parse_match_detail(raw, full_url)
+    data = merge_detail_with_list_item(data, item)
+    compact = compact_detail_payload(data, item)
+    compact["render_mode"] = response_mode(raw)
+    return compact
+
+
+async def build_details_from_filters(
+    q: str,
+    game: str,
+    team1: str = "",
+    team2: str = "",
+    search: str = "",
+    max_results: int = 25,
+) -> Dict[str, Any]:
+    q_norm = (q or "current").lower().strip()
+    canonical = normalize_game(game)
+    path, hint, ttl = match_list_path(canonical, q_norm)
+    raw = await fetch_html(path, ttl=ttl)
+    parsed = parse_match_list(raw, hint)
+    rows = list(parsed.get("segments") or [])
+
+    filtered = [
+        item for item in rows
+        if item_matches_team_filters(item, team1=team1, team2=team2, search=search)
+    ]
+
+    # If exact token search failed but two teams were supplied, retry with a
+    # looser combined search so "Team Nemesis" can still find BO3's "Nemesis".
+    if not filtered and (team1 or team2) and not search:
+        combined = " ".join([team1 or "", team2 or ""]).strip()
+        if combined:
+            filtered = [item for item in rows if item_matches_team_filters(item, search=combined)]
+
+    if max_results <= 0:
+        max_results = 25
+    max_results = max(1, min(int(max_results), 80))
+    filtered = filtered[:max_results]
+
+    sem = asyncio.Semaphore(6)
+
+    async def guarded(item: Dict[str, Any]) -> Dict[str, Any]:
+        async with sem:
+            try:
+                return await fetch_compact_detail_for_item(item, canonical)
+            except Exception as exc:
+                return {
+                    "match": {
+                        "title": "%s vs %s" % (item.get("team1", ""), item.get("team2", "")),
+                        "url": item.get("url", ""),
+                        "status": item.get("status", ""),
+                        "bo": item.get("bo", ""),
+                        "team1": item.get("team1", ""),
+                        "team2": item.get("team2", ""),
+                        "score1": item.get("score1"),
+                        "score2": item.get("score2"),
+                        "winner": item.get("winner", ""),
+                        "error": str(exc),
+                    },
+                    "maps": [],
+                    "source_row": item,
+                }
+
+    matches = await asyncio.gather(*[guarded(item) for item in filtered]) if filtered else []
+
+    # Backwards/VLR-ish convenience: a flat segment per match with maps included.
+    segments = []
+    for item in matches:
+        flat = dict(item.get("match") or {})
+        flat["maps"] = item.get("maps") or []
+        flat["source_row"] = item.get("source_row") or {}
+        segments.append(flat)
+
+    return {
+        "status": 200,
+        "game": canonical,
+        "query": q_norm,
+        "source_path": path,
+        "render_mode": response_mode(raw),
+        "filters": {
+            "team1": team1 or "",
+            "team2": team2 or "",
+            "search": search or "",
+            "max_results": max_results,
+        },
+        "count": len(matches),
+        "matches": matches,
+        "segments": segments,
+    }
+
 def is_client_shell(raw_html: str) -> bool:
     if not raw_html:
         return True
@@ -1360,7 +1579,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.4.0", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.5.0", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -1428,32 +1647,64 @@ async def match_all(
 
 @app.get("/v2/match/details", tags=["Matches"])
 async def match_details(
-    url: Optional[str] = Query(None, description="Full BO3.gg match URL"),
-    path: Optional[str] = Query(None, description="BO3.gg match path, e.g. /matches/team-a-vs-team-b-31-05-2026"),
+    q: str = Query("current", description="current/live/schedule/upcoming/finished/results"),
+    game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb"),
+    team1: str = Query("", description="Optional team filter, e.g. Team Nemesis"),
+    team2: str = Query("", description="Optional opponent filter, e.g. FOKUS"),
+    search: str = Query("", description="Optional loose text search over team names/raw row/url"),
+    max_results: int = Query(25, ge=1, le=80, description="Maximum details to fetch when no URL/path is provided"),
+    url: Optional[str] = Query(None, description="Optional full BO3.gg match URL; kept for backwards compatibility"),
+    path: Optional[str] = Query(None, description="Optional BO3.gg match path; kept for backwards compatibility"),
 ) -> Dict[str, Any]:
+    """Return compact match + individual map/game winners.
+
+    Preferred verifier usage does NOT need a URL:
+      /v2/match/details?game=cs2&q=live&team1=Team%20Nemesis&team2=FOKUS
+      /v2/match/details?game=cs2&q=finished&search=Nemesis%20FOKUS
+
+    URL/path mode is still supported for manual debugging/backwards compatibility.
+    """
     target = url or path
-    if not target:
-        raise HTTPException(status_code=400, detail="provide url= or path=")
+    if target:
+        try:
+            full_url = normalize_url(target)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        if not is_match_detail_path(urlparse(full_url).path):
+            raise HTTPException(status_code=400, detail="match details URL must be a BO3 match detail URL under /matches/")
+
+        raw = await fetch_html(full_url, ttl=60)
+        canonical = game_from_path(urlparse(full_url).path)
+        data = parse_match_detail(raw, full_url)
+
+        # Detail pages are best for map results. The list page is best for live
+        # series score/winner when the detail page omits a side score.
+        list_item = await find_match_list_item_for_detail(full_url, canonical)
+        if list_item:
+            data = merge_detail_with_list_item(data, list_item)
+
+        compact = compact_detail_payload(data, list_item or None)
+        compact["status"] = 200
+        compact["game"] = canonical
+        compact["render_mode"] = response_mode(raw)
+        # Keep old VLR-style segment shape for existing callers.
+        flat = dict(compact.get("match") or {})
+        flat["maps"] = compact.get("maps") or []
+        compact["segments"] = [flat]
+        return {"status": "success", "data": compact}
+
     try:
-        full_url = normalize_url(target)
+        data = await build_details_from_filters(
+            q=q,
+            game=game,
+            team1=team1,
+            team2=team2,
+            search=search,
+            max_results=max_results,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-    if not is_match_detail_path(urlparse(full_url).path):
-        raise HTTPException(status_code=400, detail="match details URL must be a BO3 match detail URL under /matches/")
-
-    raw = await fetch_html(full_url, ttl=60)
-    canonical = game_from_path(urlparse(full_url).path)
-    data = parse_match_detail(raw, full_url)
-
-    # Detail pages are best for map results. The list page is best for live
-    # series score/winner when the detail page omits a side score.
-    list_item = await find_match_list_item_for_detail(full_url, canonical)
-    if list_item:
-        data = merge_detail_with_list_item(data, list_item)
-
-    data["game"] = canonical
-    data["render_mode"] = response_mode(raw)
     return {"status": "success", "data": data}
 
 
