@@ -1647,14 +1647,6 @@ async def build_details_from_filters(
 
     matches = await asyncio.gather(*[guarded(item) for item in deduped_rows]) if deduped_rows else []
 
-    # Backwards/VLR-ish convenience: a flat segment per match with maps included.
-    segments = []
-    for item in matches:
-        flat = dict(item.get("match") or {})
-        flat["maps"] = item.get("maps") or []
-        flat["source_row"] = item.get("source_row") or {}
-        segments.append(flat)
-
     render_mode = "+".join(sorted(set(render_modes))) if render_modes else "unknown"
     return {
         "status": 200,
@@ -1672,7 +1664,6 @@ async def build_details_from_filters(
         },
         "count": len(matches),
         "matches": matches,
-        "segments": segments,
         "errors": query_errors,
     }
 
