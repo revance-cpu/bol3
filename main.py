@@ -1558,12 +1558,17 @@ async def build_details_from_filters(
     q_norm = (q or "both").lower().strip()
     canonical = normalize_game(game)
 
+    # BO3.gg's live page path is /matches/current, but expose it as "live"
+    # in API metadata because callers/verifiers reason about live vs finished.
+    # Internally we still fetch "current" because that is the real BO3 path.
     if q_norm in {"", "all", "both", "live_finished", "live+finished", "current+finished"}:
         query_plan = ["current", "finished"]
-        query_label = "current+finished"
+        display_query_plan = ["live", "finished"]
+        query_label = "live+finished"
     else:
         query_plan = [q_norm]
-        query_label = q_norm
+        display_query_plan = ["live" if q_norm == "current" else q_norm]
+        query_label = display_query_plan[0]
 
     if max_results <= 0:
         max_results = 25
@@ -1583,7 +1588,7 @@ async def build_details_from_filters(
             render_modes.append(response_mode(raw))
             for item in list(parsed.get("segments") or []):
                 item = dict(item)
-                item["source_query"] = q_item
+                item["source_query"] = "live" if q_item == "current" else q_item
                 item["source_path"] = path
                 all_rows.append(item)
         except Exception as exc:
@@ -1655,7 +1660,7 @@ async def build_details_from_filters(
         "status": 200,
         "game": canonical,
         "query": query_label,
-        "queries": query_plan,
+        "queries": display_query_plan,
         "source_path": source_paths[0] if len(source_paths) == 1 else "",
         "source_paths": source_paths,
         "render_mode": render_mode,
@@ -1831,7 +1836,7 @@ async def match_all(
 
 @app.get("/v2/match/details", tags=["Matches"])
 async def match_details(
-    q: Optional[str] = Query(None, description="Optional: current/live/schedule/upcoming/finished/results. Omit to search current+finished."),
+    q: Optional[str] = Query(None, description="Optional: live/current/schedule/upcoming/finished/results. Omit to search live+finished."),
     game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb"),
     team1: str = Query("", description="Optional team filter, e.g. Team Nemesis"),
     team2: str = Query("", description="Optional opponent filter, e.g. FOKUS"),
@@ -1846,8 +1851,9 @@ async def match_details(
       /v2/match/details?game=cs2&team1=Team%20Nemesis&team2=FOKUS
       /v2/match/details?game=cs2&search=Nemesis%20FOKUS
 
-    When q is omitted, this endpoint searches current/live and finished/results
-    together. You can still pass q=live or q=finished to force one list.
+    When q is omitted, this endpoint searches live/current and finished/results
+    together. Response metadata reports live+finished even though BO3's live
+    HTML path is /matches/current. You can still pass q=live or q=finished.
 
     URL/path mode is still supported for manual debugging/backwards compatibility.
     """

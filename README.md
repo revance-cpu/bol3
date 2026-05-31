@@ -32,7 +32,7 @@ GET /v2/debug/fetch?game=cs2&q=finished
 
 ## Verifier details endpoint
 
-`/v2/match/details` now searches both live/current and finished/results when `q` is omitted.
+`/v2/match/details` now searches both live and finished by default when `q` is omitted. Internally BO3 uses `/matches/current` for live matches, but API metadata reports `live+finished`.
 
 ```text
 GET /v2/match/details?game=cs2&team1=Team%20Nemesis&team2=FOKUS
