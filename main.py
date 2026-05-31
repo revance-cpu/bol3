@@ -16,7 +16,8 @@ Examples:
   curl "http://127.0.0.1:3002/v2/match?game=cs2&q=finished"
   curl "http://127.0.0.1:3002/v2/match?game=valorant&q=current"
   curl "http://127.0.0.1:3002/v2/match/all?q=finished"
-  curl "http://127.0.0.1:3002/v2/match/details?game=cs2&q=live&team1=Team%20Nemesis&team2=FOKUS"
+  curl "http://127.0.0.1:3002/v2/match/details?game=cs2&team1=Team%20Nemesis&team2=FOKUS"
+  curl "http://127.0.0.1:3002/v2/match/details?game=cs2&search=Nemesis%20FOKUS"
   curl "http://127.0.0.1:3002/v2/match/details?game=cs2&q=finished&search=Nemesis%20FOKUS"
   curl "http://127.0.0.1:3002/v2/match/details?url=https://bo3.gg/matches/gentle-mates-cs-vs-team-nemesis-cs-31-05-2026"
 """
@@ -994,91 +995,230 @@ def canonical_map_name(value: str) -> str:
     return ""
 
 
-def parse_map_scores(lines: List[str], visible: str, team1: str, team2: str) -> List[Dict[str, Any]]:
-    """Parse the actual played map/game rows only.
+def map_name_from_line(value: str) -> str:
+    """Return a canonical map/game label from either a bare or noisy line."""
+    raw = collapse_ws(value)
+    if not raw:
+        return ""
+    bare = canonical_map_name(raw)
+    if bare:
+        return bare
 
-    The old parser looked too far past the map tabs and accidentally treated
-    BO3's "Score predict" odds like a real map result. This version only reads
-    the Full match Winner/map-tab area and stops before Score predict, streams,
-    scoreboards, form tables, lineups, picks/bans, and H2H.
+    # Generic map/game labels for MOBAs and unconfirmed deciders.
+    m_generic = re.search(r"\b(?:Map|Game)\s*(\d+)\b", raw, flags=re.I)
+    if m_generic:
+        word = "Game" if re.search(r"\bGame\b", raw, flags=re.I) else "Map"
+        return "%s %s" % (word, m_generic.group(1))
+
+    for name in MAP_NAMES:
+        if re.search(r"\b" + re.escape(name) + r"\b", raw, flags=re.I):
+            return "Dust II" if name == "Dust 2" else name
+    return ""
+
+
+def expected_maps_from_series(score1: Optional[int], score2: Optional[int], bo: str = "") -> int:
+    if score1 is not None and score2 is not None:
+        total = int(score1) + int(score2)
+        if total > 0:
+            return total
+    bo_m = re.search(r"bo([1357])", bo or "", flags=re.I)
+    if bo_m:
+        return int(bo_m.group(1))
+    return 0
+
+
+def trim_maps_for_series(
+    maps: List[Dict[str, Any]],
+    score1: Optional[int],
+    score2: Optional[int],
+    bo: str = "",
+) -> List[Dict[str, Any]]:
+    """Keep only plausible actual map rows.
+
+    BO3 pages repeat map names in predictions, H2H, veto, and stats sections.
+    Actual match maps appear first and their count should equal the current or
+    final series score total.  This makes the endpoint verifier-safe instead
+    of inventing extra historical maps.
     """
-    stop_re = (
-        r"^(?:Score predict|Stream|Analytics Insights|Team Form|Teams advantage|Lineups|"
-        r"Picks\s*&\s*bans|Historical|Head to head|Comments|Latest top news|Overview|"
-        r"Performance|Aim|Grenades|Devices|Economy)|\bScoreboard$"
+    if not maps:
+        return maps
+    limit = expected_maps_from_series(score1, score2, bo)
+    if limit and len(maps) > limit:
+        return maps[:limit]
+    return maps
+
+
+def _score_from_int_lines(candidates: List[str]) -> Optional[Tuple[int, int]]:
+    ints: List[int] = []
+    for value in candidates:
+        value = collapse_ws(value)
+        if is_int_line(value):
+            try:
+                ints.append(int(value))
+            except Exception:
+                pass
+        if len(ints) >= 2:
+            return ints[0], ints[1]
+    return None
+
+
+def _append_map_score(
+    maps: List[Dict[str, Any]],
+    map_name: str,
+    score1: Optional[int],
+    score2: Optional[int],
+    team1: str,
+    team2: str,
+) -> None:
+    if not map_name:
+        return
+    winner = ""
+    if score1 is not None and score2 is not None and team1 and team2:
+        winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+    maps.append(
+        {
+            "game": len(maps) + 1,
+            "map": map_name,
+            "team1": team1,
+            "team2": team2,
+            "score1": score1,
+            "score2": score2,
+            "winner": winner,
+        }
     )
 
-    section = lines_between_markers(lines, r"^Full match Winner$", stop_re)
 
-    # Live/upcoming pages often have map tabs but no "Full match Winner" marker.
-    # Use the block after the header and before Score predict/Stream/etc.
-    if not section:
-        top = detail_top_lines(lines, max_lines=160)
-        section = []
-        started = False
-        for line in top:
-            if canonical_map_name(line):
-                started = True
-            if started:
-                if is_section_stop(line):
-                    break
-                section.append(line)
-
-    maps: List[Dict[str, Any]] = []
-    i = 0
-    while i < len(section):
-        map_name = canonical_map_name(section[i])
-        if not map_name:
-            i += 1
-            continue
-
-        score1: Optional[int] = None
-        score2: Optional[int] = None
-        # The score is usually the next line. Search a tiny window, but stop if
-        # another map/tab or a new section starts first.
-        for j in range(i + 1, min(i + 4, len(section))):
-            if is_section_stop(section[j]) or canonical_map_name(section[j]):
-                break
-            score = parse_score(section[j])
-            if score:
-                score1, score2 = score
-                break
-
-        winner = ""
-        if score1 is not None and score2 is not None and team1 and team2:
-            winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
-
-        maps.append(
-            {
-                "game": len(maps) + 1,
-                "map": map_name,
-                "team1": team1,
-                "team2": team2,
-                "score1": score1,
-                "score2": score2,
-                "winner": winner,
-            }
-        )
-        i += 1
-
-    # Remove duplicates while preserving order. Prefer scored rows over null rows.
+def _dedupe_map_scores(maps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
-    by_map: Dict[str, int] = {}
+    seen = set()
     for item in maps:
-        key = norm_key(item.get("map", "")) or str(item.get("game"))
-        existing_idx = by_map.get(key)
-        if existing_idx is None:
-            by_map[key] = len(deduped)
-            deduped.append(item)
+        map_name = item.get("map", "") or ""
+        score1 = item.get("score1")
+        score2 = item.get("score2")
+        key = (norm_key(map_name), score1, score2)
+        if key in seen:
             continue
-        existing = deduped[existing_idx]
-        if existing.get("score1") is None and item.get("score1") is not None:
-            item["game"] = existing.get("game", item["game"])
-            deduped[existing_idx] = item
-
-    for idx, item in enumerate(deduped, 1):
-        item["game"] = idx
+        # Prefer scored rows. Bare map tabs without score are not useful for a
+        # verifier once scored rows are available for the same map.
+        if score1 is None or score2 is None:
+            scored_same_map = any(
+                norm_key(x.get("map", "")) == norm_key(map_name)
+                and x.get("score1") is not None
+                and x.get("score2") is not None
+                for x in maps
+            )
+            if scored_same_map:
+                continue
+        seen.add(key)
+        item = dict(item)
+        item["game"] = len(deduped) + 1
+        deduped.append(item)
     return deduped
+
+
+def _scan_map_scores_from_lines(lines: List[str], team1: str, team2: str) -> List[Dict[str, Any]]:
+    maps: List[Dict[str, Any]] = []
+    stop_after_match_re = re.compile(
+        r"^(?:Score predict|Stream|Analytics Insights|Team Form|Teams advantage|Lineups|"
+        r"Picks\s*&\s*bans|Historical|Head to head|Comments|Latest top news)$",
+        flags=re.I,
+    )
+
+    # Prefer the upper match-detail block.  It normally contains:
+    #   Full stats / Ancient / 10 - 13 / Inferno / 13 - 7 / Mirage / 13 - 9
+    # and appears before predictions, streams, lineups, H2H, etc.
+    cutoff = len(lines)
+    for i, line in enumerate(lines):
+        if stop_after_match_re.search(line):
+            cutoff = i
+            break
+    scan_lines = lines[: min(cutoff, 260)]
+
+    for i, line in enumerate(scan_lines):
+        map_name = map_name_from_line(line)
+        if not map_name:
+            continue
+
+        # Avoid navigation/sport names that can accidentally contain a map word.
+        if line.casefold() in {"maps", "map", "games", "game"}:
+            continue
+
+        score: Optional[Tuple[int, int]] = parse_score(line)
+        if score is None:
+            next_lines: List[str] = []
+            for j in range(i + 1, min(i + 10, len(scan_lines))):
+                if is_section_stop(scan_lines[j]) or stop_after_match_re.search(scan_lines[j]):
+                    break
+                if map_name_from_line(scan_lines[j]):
+                    break
+                next_lines.append(scan_lines[j])
+                score = parse_score(scan_lines[j])
+                if score is not None:
+                    break
+            if score is None:
+                score = _score_from_int_lines(next_lines)
+
+        if score is not None:
+            _append_map_score(maps, map_name, int(score[0]), int(score[1]), team1, team2)
+        else:
+            # Keep unscored map tabs for live matches, but dedupe/trim later.
+            _append_map_score(maps, map_name, None, None, team1, team2)
+
+    return _dedupe_map_scores(maps)
+
+
+def _scan_map_scores_from_text_blob(text: str, team1: str, team2: str) -> List[Dict[str, Any]]:
+    maps: List[Dict[str, Any]] = []
+    text = collapse_ws(text)
+    if not text:
+        return maps
+
+    map_alt = "|".join(re.escape(x) for x in MAP_NAMES)
+    generic_alt = r"(?:Map|Game)\s*\d+"
+    any_map = r"(?:" + map_alt + r"|" + generic_alt + r")"
+
+    # Visible inline form: Ancient 10 - 13
+    for m in re.finditer(r"\b(?P<map>" + any_map + r")\b\s{1,80}(?P<s1>\d{1,2})\s*-\s*(?P<s2>\d{1,2})\b", text, flags=re.I):
+        map_name = map_name_from_line(m.group("map"))
+        _append_map_score(maps, map_name, int(m.group("s1")), int(m.group("s2")), team1, team2)
+
+    # JSON-ish form from Nuxt payloads, when the visible text only exposes the
+    # header but the page still embeds map score objects.
+    json_score_keys_1 = r"(?:score1|score_1|team1Score|firstTeamScore|homeScore|scoreTeam1)"
+    json_score_keys_2 = r"(?:score2|score_2|team2Score|secondTeamScore|awayScore|scoreTeam2)"
+    for m in re.finditer(
+        r"(?P<map>" + any_map + r")(?:(?!" + any_map + r").){0,350}?"
+        r"(?:\"|'|\b)" + json_score_keys_1 + r"(?:\"|'|\b)\s*[:=]\s*(?P<s1>\d{1,2})"
+        r"(?:(?!" + any_map + r").){0,180}?"
+        r"(?:\"|'|\b)" + json_score_keys_2 + r"(?:\"|'|\b)\s*[:=]\s*(?P<s2>\d{1,2})",
+        text,
+        flags=re.I,
+    ):
+        map_name = map_name_from_line(m.group("map"))
+        _append_map_score(maps, map_name, int(m.group("s1")), int(m.group("s2")), team1, team2)
+
+    return _dedupe_map_scores(maps)
+
+
+def parse_map_scores(lines: List[str], visible: str, raw_html: str, team1: str, team2: str) -> List[Dict[str, Any]]:
+    """Parse actual played map/game rows only.
+
+    This endpoint is meant for verification, so it should return the real match
+    winner plus real per-map/game winners.  It intentionally ignores streams,
+    lineups, picks/bans, odds, prediction widgets, and H2H/history sections.
+    """
+    maps = _scan_map_scores_from_lines(lines, team1, team2)
+    if maps and any(item.get("score1") is not None and item.get("score2") is not None for item in maps):
+        return maps
+
+    # Fallback to a compact text blob.  This recovers pages where BO3 embeds
+    # map scores in Nuxt/JSON-ish payloads but the visible parser only saw the
+    # match header.
+    blob = "\n".join([visible or "", strip_tags(raw_html or ""), html.unescape(raw_html or "")])
+    maps2 = _scan_map_scores_from_text_blob(blob, team1, team2)
+    if maps2:
+        return maps2
+    return maps
 
 def slice_between(lines: List[str], start_regex: str, stop_regex: str) -> List[str]:
     start = None
@@ -1172,9 +1312,11 @@ def parse_match_detail(raw_html: str, source_url: str) -> Dict[str, Any]:
                 tournament = cand
 
     status = status_from_detail_lines(lines)
-    maps = parse_map_scores(lines, visible, team1, team2)
     series = parse_series_score(lines, visible, team1, team2)
-    bo = parse_bo_from_lines(lines) or infer_bo_from_series(series["score1"], series["score2"], maps)
+    bo_from_page = parse_bo_from_lines(lines)
+    maps = parse_map_scores(lines, visible, raw_html, team1, team2)
+    maps = trim_maps_for_series(maps, series["score1"], series["score2"], bo_from_page)
+    bo = bo_from_page or infer_bo_from_series(series["score1"], series["score2"], maps)
 
     match_summary = {
         "title": title,
@@ -1413,15 +1555,42 @@ async def build_details_from_filters(
     search: str = "",
     max_results: int = 25,
 ) -> Dict[str, Any]:
-    q_norm = (q or "current").lower().strip()
+    q_norm = (q or "both").lower().strip()
     canonical = normalize_game(game)
-    path, hint, ttl = match_list_path(canonical, q_norm)
-    raw = await fetch_html(path, ttl=ttl)
-    parsed = parse_match_list(raw, hint)
-    rows = list(parsed.get("segments") or [])
+
+    if q_norm in {"", "all", "both", "live_finished", "live+finished", "current+finished"}:
+        query_plan = ["current", "finished"]
+        query_label = "current+finished"
+    else:
+        query_plan = [q_norm]
+        query_label = q_norm
+
+    if max_results <= 0:
+        max_results = 25
+    max_results = max(1, min(int(max_results), 80))
+
+    all_rows: List[Dict[str, Any]] = []
+    source_paths: List[str] = []
+    render_modes: List[str] = []
+    query_errors: Dict[str, str] = {}
+
+    for q_item in query_plan:
+        try:
+            path, hint, ttl = match_list_path(canonical, q_item)
+            raw = await fetch_html(path, ttl=ttl)
+            parsed = parse_match_list(raw, hint)
+            source_paths.append(path)
+            render_modes.append(response_mode(raw))
+            for item in list(parsed.get("segments") or []):
+                item = dict(item)
+                item["source_query"] = q_item
+                item["source_path"] = path
+                all_rows.append(item)
+        except Exception as exc:
+            query_errors[q_item] = str(exc)
 
     filtered = [
-        item for item in rows
+        item for item in all_rows
         if item_matches_team_filters(item, team1=team1, team2=team2, search=search)
     ]
 
@@ -1430,12 +1599,22 @@ async def build_details_from_filters(
     if not filtered and (team1 or team2) and not search:
         combined = " ".join([team1 or "", team2 or ""]).strip()
         if combined:
-            filtered = [item for item in rows if item_matches_team_filters(item, search=combined)]
+            filtered = [item for item in all_rows if item_matches_team_filters(item, search=combined)]
 
-    if max_results <= 0:
-        max_results = 25
-    max_results = max(1, min(int(max_results), 80))
-    filtered = filtered[:max_results]
+    # Deduplicate current/finished overlap by match URL. Prefer live/current rows
+    # over finished only when the same URL appears in both lists.
+    deduped_rows: List[Dict[str, Any]] = []
+    seen_urls = set()
+    for item in filtered:
+        key = canonical_match_path(urlparse(item.get("url", "") or "").path).rstrip("/") or (
+            norm_key(item.get("team1", "")), norm_key(item.get("team2", "")), str(item.get("score1")), str(item.get("score2"))
+        )
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        deduped_rows.append(item)
+
+    deduped_rows = deduped_rows[:max_results]
 
     sem = asyncio.Semaphore(6)
 
@@ -1461,7 +1640,7 @@ async def build_details_from_filters(
                     "source_row": item,
                 }
 
-    matches = await asyncio.gather(*[guarded(item) for item in filtered]) if filtered else []
+    matches = await asyncio.gather(*[guarded(item) for item in deduped_rows]) if deduped_rows else []
 
     # Backwards/VLR-ish convenience: a flat segment per match with maps included.
     segments = []
@@ -1471,12 +1650,15 @@ async def build_details_from_filters(
         flat["source_row"] = item.get("source_row") or {}
         segments.append(flat)
 
+    render_mode = "+".join(sorted(set(render_modes))) if render_modes else "unknown"
     return {
         "status": 200,
         "game": canonical,
-        "query": q_norm,
-        "source_path": path,
-        "render_mode": response_mode(raw),
+        "query": query_label,
+        "queries": query_plan,
+        "source_path": source_paths[0] if len(source_paths) == 1 else "",
+        "source_paths": source_paths,
+        "render_mode": render_mode,
         "filters": {
             "team1": team1 or "",
             "team2": team2 or "",
@@ -1486,7 +1668,9 @@ async def build_details_from_filters(
         "count": len(matches),
         "matches": matches,
         "segments": segments,
+        "errors": query_errors,
     }
+
 
 def is_client_shell(raw_html: str) -> bool:
     if not raw_html:
@@ -1579,7 +1763,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.5.0", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.0", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -1647,7 +1831,7 @@ async def match_all(
 
 @app.get("/v2/match/details", tags=["Matches"])
 async def match_details(
-    q: str = Query("current", description="current/live/schedule/upcoming/finished/results"),
+    q: Optional[str] = Query(None, description="Optional: current/live/schedule/upcoming/finished/results. Omit to search current+finished."),
     game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb"),
     team1: str = Query("", description="Optional team filter, e.g. Team Nemesis"),
     team2: str = Query("", description="Optional opponent filter, e.g. FOKUS"),
@@ -1658,9 +1842,12 @@ async def match_details(
 ) -> Dict[str, Any]:
     """Return compact match + individual map/game winners.
 
-    Preferred verifier usage does NOT need a URL:
-      /v2/match/details?game=cs2&q=live&team1=Team%20Nemesis&team2=FOKUS
-      /v2/match/details?game=cs2&q=finished&search=Nemesis%20FOKUS
+    Preferred verifier usage does NOT need a URL or q:
+      /v2/match/details?game=cs2&team1=Team%20Nemesis&team2=FOKUS
+      /v2/match/details?game=cs2&search=Nemesis%20FOKUS
+
+    When q is omitted, this endpoint searches current/live and finished/results
+    together. You can still pass q=live or q=finished to force one list.
 
     URL/path mode is still supported for manual debugging/backwards compatibility.
     """
@@ -1696,7 +1883,7 @@ async def match_details(
 
     try:
         data = await build_details_from_filters(
-            q=q,
+            q=q or "both",
             game=game,
             team1=team1,
             team2=team2,
