@@ -1,6 +1,6 @@
 """
 Unofficial BO3.gg REST API wrapper
-Python 3.9 compatible.
+Python 3.9 compatible. Multi-game build for CS2, Valorant, R6S, Dota2, LoL, and MLBB.
 
 Vercel/GitHub layout:
   main.py
@@ -13,8 +13,9 @@ Local run:
   python3 main.py
 
 Examples:
-  curl "http://127.0.0.1:3002/v2/match?q=finished"
-  curl "http://127.0.0.1:3002/v2/match?q=current"
+  curl "http://127.0.0.1:3002/v2/match?game=cs2&q=finished"
+  curl "http://127.0.0.1:3002/v2/match?game=valorant&q=current"
+  curl "http://127.0.0.1:3002/v2/match/all?q=finished"
   curl "http://127.0.0.1:3002/v2/match/details?url=https://bo3.gg/matches/gentle-mates-cs-vs-team-nemesis-cs-31-05-2026"
 """
 
@@ -40,6 +41,43 @@ DEFAULT_TIMEOUT = float(os.getenv("BO3API_TIMEOUT", "20"))
 CACHE_TTL_SECONDS = int(os.getenv("BO3API_CACHE_TTL", "30"))
 DEBUG_FETCH_CHARS = int(os.getenv("BO3API_DEBUG_FETCH_CHARS", "1500"))
 
+# BO3.gg separates games by URL namespace. Root /matches is CS2 only.
+GAME_PREFIXES = {
+    "cs2": "",
+    "cs": "",
+    "counterstrike": "",
+    "counter-strike": "",
+    "valorant": "/valorant",
+    "val": "/valorant",
+    "r6s": "/r6siege",
+    "r6": "/r6siege",
+    "rainbow6": "/r6siege",
+    "rainbow-six": "/r6siege",
+    "rainbowsix": "/r6siege",
+    "r6siege": "/r6siege",
+    "dota2": "/dota2",
+    "dota": "/dota2",
+    "lol": "/lol",
+    "league": "/lol",
+    "leagueoflegends": "/lol",
+    "league-of-legends": "/lol",
+    "mlbb": "/mlbb",
+    "mobilelegends": "/mlbb",
+    "mobile-legends": "/mlbb",
+}
+
+CANONICAL_GAMES = {
+    "cs2": {"slug": "cs2", "name": "CS2", "prefix": ""},
+    "valorant": {"slug": "valorant", "name": "Valorant", "prefix": "/valorant"},
+    "r6s": {"slug": "r6s", "name": "Rainbow Six Siege", "prefix": "/r6siege"},
+    "dota2": {"slug": "dota2", "name": "Dota 2", "prefix": "/dota2"},
+    "lol": {"slug": "lol", "name": "League of Legends", "prefix": "/lol"},
+    "mlbb": {"slug": "mlbb", "name": "Mobile Legends: Bang Bang", "prefix": "/mlbb"},
+}
+
+PREFIX_TO_GAME = {"": "cs2", "/valorant": "valorant", "/r6siege": "r6s", "/dota2": "dota2", "/lol": "lol", "/mlbb": "mlbb"}
+GAME_PREFIX_PATTERN = r"(?:valorant|r6siege|dota2|lol|mlbb)"
+
 # Do not request br/zstd. Vercel's Python runtime + httpx can behave differently
 # depending on optional decoder packages. gzip/deflate are safe everywhere.
 HEADERS = {
@@ -55,6 +93,42 @@ HEADERS = {
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
 }
+
+# BO3.gg/Nuxt can return an empty client-side shell to normal server-side
+# HTTP clients. Search crawlers often receive prerendered HTML. Try those UAs
+# before giving up, otherwise Vercel gets 0 visible chars / 0 anchors.
+HEADER_PROFILES = [
+    ("desktop", HEADERS),
+    (
+        "googlebot",
+        dict(
+            HEADERS,
+            **{
+                "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "X-Forwarded-For": "66.249.66.1",
+            },
+        ),
+    ),
+    (
+        "bingbot",
+        dict(
+            HEADERS,
+            **{
+                "User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+                "X-Forwarded-For": "40.77.167.1",
+            },
+        ),
+    ),
+    (
+        "facebook",
+        dict(
+            HEADERS,
+            **{
+                "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            },
+        ),
+    ),
+]
 
 MAP_NAMES = (
     "Dust II",
@@ -223,6 +297,38 @@ def strip_tags(fragment: str) -> str:
     return collapse_ws(fragment)
 
 
+def normalize_game(game: str) -> str:
+    key = re.sub(r"[^a-z0-9-]+", "", (game or "cs2").strip().lower())
+    if not key:
+        key = "cs2"
+    if key not in GAME_PREFIXES:
+        raise ValueError("unsupported game '%s'; use cs2, valorant, r6s, dota2, lol, or mlbb" % game)
+    prefix = GAME_PREFIXES[key]
+    return PREFIX_TO_GAME.get(prefix, "cs2")
+
+
+def game_prefix(game: str) -> str:
+    canonical = normalize_game(game)
+    return CANONICAL_GAMES[canonical]["prefix"]
+
+
+def game_from_path(path: str) -> str:
+    path = path or ""
+    m = re.match(r"^/(?:[a-z]{2}(?:-[a-z]{2})?/)?(" + GAME_PREFIX_PATTERN + r")(?=/|$)", path, flags=re.I)
+    if m:
+        return PREFIX_TO_GAME.get("/" + m.group(1).lower(), "cs2")
+    return "cs2"
+
+
+def match_list_path(game: str, q_norm: str) -> Tuple[str, str, int]:
+    prefix = game_prefix(game)
+    if q_norm in {"current", "live", "schedule", "upcoming"}:
+        return prefix + "/matches/current", "current", 20
+    if q_norm in {"finished", "results"}:
+        return prefix + "/matches/finished", "finished", 60
+    raise ValueError("q must be one of current/live/schedule/upcoming/finished/results")
+
+
 def normalize_url(url_or_path: str) -> str:
     if not url_or_path:
         raise ValueError("empty URL/path")
@@ -244,18 +350,23 @@ def abs_bo3_url(href: str) -> str:
 
 def canonical_match_path(path: str) -> str:
     path = path or ""
-    # BO3 has language prefixes on some links. Strip /en/, /de/, etc. if present.
-    m = re.match(r"^/[a-z]{2}(?:-[a-z]{2})?(/matches/.*)$", path, flags=re.I)
+    # BO3 can prepend language prefixes, e.g. /en/valorant/matches/...
+    m = re.match(r"^/[a-z]{2}(?:-[a-z]{2})?(/(?:(?:" + GAME_PREFIX_PATTERN + r")/)?matches/.*)$", path, flags=re.I)
     if m:
         return m.group(1)
     return path
 
 
+def is_match_collection_path(path: str) -> bool:
+    path = canonical_match_path(path).rstrip("/").lower()
+    return bool(re.fullmatch(r"/(?:" + GAME_PREFIX_PATTERN + r"/)?matches(?:/(?:current|finished))?", path))
+
+
 def is_match_detail_path(path: str) -> bool:
     path = canonical_match_path(path).rstrip("/")
-    if not path.startswith("/matches/"):
+    if is_match_collection_path(path):
         return False
-    return path not in {"/matches", "/matches/current", "/matches/finished"}
+    return bool(re.match(r"^/(?:" + GAME_PREFIX_PATTERN + r"/)?matches/[^/]+$", path, flags=re.I))
 
 
 def extract_anchors_htmlparser(raw_html: str) -> List[Dict[str, str]]:
@@ -386,7 +497,7 @@ def parse_html_title(raw_html: str) -> str:
 
 def cleanup_page_title(title: str) -> str:
     title = collapse_ws(title)
-    title = re.sub(r"\s+-\s+CS2\s+Match.*$", "", title, flags=re.I)
+    title = re.sub(r"\s+-\s+(?:CS2|Valorant|R6SIEGE|R6|Dota2?|LoL|MLBB)\s+Match.*$", "", title, flags=re.I)
     title = re.sub(r"\s+\|\s+BO3\.gg.*$", "", title, flags=re.I)
     title = re.sub(r"\s+\|\s+bo3\.gg.*$", "", title, flags=re.I)
     return collapse_ws(title)
@@ -605,10 +716,64 @@ def parse_match_list_from_text(raw_html: str, status_hint: str) -> List[Dict[str
     return segments
 
 
+def parse_match_list_from_visible_lines(raw_html: str, status_hint: str) -> List[Dict[str, Any]]:
+    visible = extract_visible_text(raw_html)
+    lines = visible_lines(visible)
+    segments: List[Dict[str, Any]] = []
+    seen = set()
+    for line in lines:
+        raw = collapse_ws(line)
+        m = re.match(
+            r"^(?P<time>(?:[A-Z][a-z]{2}\s+\d{1,2},\s*)?\d{1,2}:\d{2})\s+(?P<rest>.+?)$",
+            raw,
+        )
+        if not m:
+            continue
+        rest = m.group("rest")
+        status_word = ""
+        if rest.lower().startswith("live "):
+            status_word = "live"
+            rest = rest[5:]
+        elif rest.lower().startswith("full "):
+            status_word = "finished"
+            rest = rest[5:]
+        score = re.search(r"\b(\d+)\s*-\s*(\d+)\b", rest)
+        if not score:
+            continue
+        team1 = clean_team_text(rest[: score.start()])
+        team2 = clean_team_text(rest[score.end() :])
+        if not (team1 and team2):
+            continue
+        key = (m.group("time"), norm_key(team1), norm_key(team2), score.group(1), score.group(2))
+        if key in seen:
+            continue
+        seen.add(key)
+        s1 = int(score.group(1))
+        s2 = int(score.group(2))
+        winner = team1 if s1 > s2 else team2 if s2 > s1 else "draw"
+        segments.append(
+            {
+                "raw_text": raw,
+                "status": status_word or infer_status_from_text(raw, status_hint),
+                "time": m.group("time"),
+                "bo": "",
+                "team1": team1,
+                "team2": team2,
+                "score1": s1,
+                "score2": s2,
+                "winner": winner,
+                "url": "",
+            }
+        )
+    return segments
+
+
 def parse_match_list(raw_html: str, status_hint: str) -> Dict[str, Any]:
     segments = parse_match_list_from_anchors(raw_html, status_hint)
     if not segments:
         segments = parse_match_list_from_text(raw_html, status_hint)
+    if not segments:
+        segments = parse_match_list_from_visible_lines(raw_html, status_hint)
     return {"status": 200, "segments": segments, "count": len(segments)}
 
 
@@ -884,6 +1049,23 @@ def parse_match_detail(raw_html: str, source_url: str) -> Dict[str, Any]:
     }
 
 
+def is_client_shell(raw_html: str) -> bool:
+    if not raw_html:
+        return True
+    visible = extract_visible_text(raw_html)
+    anchors = extract_anchors(raw_html)
+    if len(visible) >= 100 or anchors:
+        return False
+    lower = raw_html[:20000].lower()
+    return "_nuxt/" in lower and "<script" in lower
+
+
+def response_mode(raw_html: str) -> str:
+    if is_client_shell(raw_html):
+        return "nuxt-client-shell"
+    return "html"
+
+
 async def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
@@ -900,29 +1082,42 @@ async def fetch_html(url_or_path: str, ttl: int = CACHE_TTL_SECONDS) -> str:
 
     client = await get_client()
     last_exc: Optional[Exception] = None
-    for attempt in range(1, 4):
-        try:
-            resp = await client.get(url)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else 1.5 * attempt
-                await asyncio.sleep(min(delay, 10.0))
-                continue
-            resp.raise_for_status()
-            text = resp.text or ""
-            _cache[url] = CacheEntry(time.time(), text)
-            return text
-        except Exception as exc:
-            last_exc = exc
-            if attempt < 3:
-                await asyncio.sleep(0.5 * attempt)
+    last_text = ""
 
+    for profile_name, headers in HEADER_PROFILES:
+        for attempt in range(1, 3):
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after and retry_after.isdigit() else 1.5 * attempt
+                    await asyncio.sleep(min(delay, 10.0))
+                    continue
+                resp.raise_for_status()
+                text = resp.text or ""
+                last_text = text
+
+                # Keep trying with bot-style profiles if BO3 only gave the Nuxt
+                # empty app shell. The parser needs rendered/prerendered text.
+                if is_client_shell(text) and profile_name != HEADER_PROFILES[-1][0]:
+                    break
+
+                _cache[url] = CacheEntry(time.time(), text)
+                return text
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * attempt)
+
+    if last_text:
+        _cache[url] = CacheEntry(time.time(), last_text)
+        return last_text
     raise HTTPException(status_code=502, detail="BO3.gg fetch failed: %s" % (last_exc,))
 
 
 app = FastAPI(
     title="bo3ggapi",
-    description="Unofficial REST API wrapper for public BO3.gg CS2 pages.",
+    description="Unofficial REST API wrapper for public BO3.gg esports pages.",
     docs_url="/",
     redoc_url=None,
 )
@@ -945,15 +1140,28 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.2.0", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.3.0", "default_api": "v2", "source": "bo3.gg"}
+
+
+@app.get("/v2/games", tags=["Meta"])
+def games() -> Dict[str, Any]:
+    return {"status": "success", "data": list(CANONICAL_GAMES.values())}
 
 
 @app.get("/v2/health", tags=["Meta"])
-async def health() -> Dict[str, Any]:
+async def health(game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb")) -> Dict[str, Any]:
     try:
-        raw = await fetch_html("/matches/current", ttl=10)
+        canonical = normalize_game(game)
+        raw = await fetch_html(game_prefix(canonical) + "/matches/current", ttl=10)
         parsed = parse_match_list(raw, "current")
-        return {"status": "success", "upstream": "ok", "bytes": len(raw), "match_count": parsed["count"]}
+        return {
+            "status": "success",
+            "upstream": "ok",
+            "game": canonical,
+            "render_mode": response_mode(raw),
+            "bytes": len(raw),
+            "match_count": parsed["count"],
+        }
     except Exception as exc:
         return {"status": "error", "upstream": "failed", "error": str(exc)}
 
@@ -961,21 +1169,41 @@ async def health() -> Dict[str, Any]:
 @app.get("/v2/match", tags=["Matches"])
 async def match(
     q: str = Query(..., description="current/live/schedule/upcoming/finished/results"),
+    game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb"),
 ) -> Dict[str, Any]:
     q_norm = q.lower().strip()
-    if q_norm in {"current", "live", "schedule", "upcoming"}:
-        path = "/matches/current"
-        hint = "current"
-        ttl = 20
-    elif q_norm in {"finished", "results"}:
-        path = "/matches/finished"
-        hint = "finished"
-        ttl = 60
-    else:
-        raise HTTPException(status_code=400, detail="q must be one of current/live/schedule/upcoming/finished/results")
+    try:
+        canonical = normalize_game(game)
+        path, hint, ttl = match_list_path(canonical, q_norm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     raw = await fetch_html(path, ttl=ttl)
-    return {"status": "success", "data": parse_match_list(raw, hint)}
+    data = parse_match_list(raw, hint)
+    data["game"] = canonical
+    data["source_path"] = path
+    data["render_mode"] = response_mode(raw)
+    return {"status": "success", "data": data}
+
+
+@app.get("/v2/match/all", tags=["Matches"])
+async def match_all(
+    q: str = Query("current", description="current/live/schedule/upcoming/finished/results"),
+) -> Dict[str, Any]:
+    q_norm = q.lower().strip()
+    out: Dict[str, Any] = {}
+    for canonical in CANONICAL_GAMES:
+        try:
+            path, hint, ttl = match_list_path(canonical, q_norm)
+            raw = await fetch_html(path, ttl=ttl)
+            parsed = parse_match_list(raw, hint)
+            parsed["game"] = canonical
+            parsed["source_path"] = path
+            parsed["render_mode"] = response_mode(raw)
+            out[canonical] = parsed
+        except Exception as exc:
+            out[canonical] = {"status": 502, "segments": [], "count": 0, "error": str(exc)}
+    return {"status": "success", "data": out}
 
 
 @app.get("/v2/match/details", tags=["Matches"])
@@ -995,15 +1223,23 @@ async def match_details(
         raise HTTPException(status_code=400, detail="match details URL must be a BO3 match detail URL under /matches/")
 
     raw = await fetch_html(full_url, ttl=60)
-    return {"status": "success", "data": parse_match_detail(raw, full_url)}
+    data = parse_match_detail(raw, full_url)
+    data["game"] = game_from_path(urlparse(full_url).path)
+    data["render_mode"] = response_mode(raw)
+    return {"status": "success", "data": data}
 
 
 @app.get("/v2/search", tags=["Search"])
-async def search(q: str = Query(..., min_length=2), source: str = Query("finished")) -> Dict[str, Any]:
+async def search(
+    q: str = Query(..., min_length=2),
+    source: str = Query("finished"),
+    game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb"),
+) -> Dict[str, Any]:
     source_norm = source.lower().strip()
-    path = "/matches/current" if source_norm in {"current", "live", "upcoming"} else "/matches/finished"
+    canonical = normalize_game(game)
+    path, hint, _ttl = match_list_path(canonical, "current" if source_norm in {"current", "live", "upcoming"} else "finished")
     raw = await fetch_html(path, ttl=30)
-    data = parse_match_list(raw, "current" if path.endswith("current") else "finished")
+    data = parse_match_list(raw, hint)
     q_fold = q.casefold()
     matches = []
     for item in data["segments"]:
@@ -1017,15 +1253,23 @@ async def search(q: str = Query(..., min_length=2), source: str = Query("finishe
         ).casefold()
         if q_fold in haystack:
             matches.append(item)
-    return {"status": "success", "data": {"status": 200, "segments": matches, "count": len(matches)}}
+    return {"status": "success", "data": {"status": 200, "game": canonical, "segments": matches, "count": len(matches)}}
 
 
 @app.get("/v2/debug/fetch", tags=["Debug"])
 async def debug_fetch(
     url: Optional[str] = Query(None, description="Full BO3.gg URL"),
-    path: Optional[str] = Query("/matches/finished", description="BO3.gg path"),
+    path: Optional[str] = Query(None, description="BO3.gg path"),
+    game: str = Query("cs2", description="Used only when path/url is omitted"),
+    q: str = Query("finished", description="current or finished; used only when path/url is omitted"),
 ) -> Dict[str, Any]:
-    target = url or path or "/matches/finished"
+    if url or path:
+        target = url or path or "/matches/finished"
+    else:
+        try:
+            target, _hint, _ttl = match_list_path(normalize_game(game), q.lower().strip())
+        except ValueError:
+            target = game_prefix(game) + "/matches/finished"
     full_url = normalize_url(target)
     raw = await fetch_html(full_url, ttl=0)
     visible = extract_visible_text(raw)
@@ -1034,6 +1278,8 @@ async def debug_fetch(
     return {
         "status": "success",
         "url": full_url,
+        "game": game_from_path(urlparse(full_url).path),
+        "render_mode": response_mode(raw),
         "bytes": len(raw),
         "visible_chars": len(visible),
         "anchor_count": len(anchors),
