@@ -612,6 +612,7 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
     if not is_match_detail_path(href_path):
         return None
 
+    status = infer_status_from_text(raw, status_hint)
     slug_team1, slug_team2 = teams_from_match_slug(href_path)
 
     # Some BO3 anchor text can be empty if icons/images wrap the card. In that
@@ -663,10 +664,17 @@ def parse_match_anchor(text: str, href: str, status_hint: str) -> Optional[Dict[
             else:
                 team1 = team1 or cleaned
 
-    status = infer_status_from_text(raw, status_hint)
     winner = ""
     if score1 is not None and score2 is not None and team1 and team2:
         winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+
+    # BO3's /matches/current page can include upcoming cards with prediction
+    # tails like "1 3 - 2". Those numbers are not actual scores. Keep the row
+    # searchable as upcoming, but never expose a fake score/winner for it.
+    if status in {"upcoming", "scheduled"}:
+        score1 = None
+        score2 = None
+        winner = ""
 
     return {
         "raw_text": raw,
@@ -795,15 +803,49 @@ def parse_match_list(raw_html: str, status_hint: str) -> Dict[str, Any]:
     # BO3 sometimes mixes future/upcoming rows into the finished page.
     # For verifier use, finished/results must only return rows with a real score.
     if status_hint == "finished":
-        segments = [
-            item
-            for item in segments
-            if item.get("score1") is not None
-            and item.get("score2") is not None
-            and bool(item.get("winner"))
-        ]
+        segments = [item for item in segments if segment_has_real_result(item)]
 
     return {"status": 200, "segments": segments, "count": len(segments)}
+
+
+def segment_has_real_result(item: Dict[str, Any]) -> bool:
+    return (
+        item.get("score1") is not None
+        and item.get("score2") is not None
+        and bool(item.get("winner"))
+    )
+
+
+def filter_segments_for_request(segments: List[Dict[str, Any]], q_norm: str) -> List[Dict[str, Any]]:
+    """Apply the public q= intent after BO3's mixed current page is parsed.
+
+    BO3 uses /matches/current for both live/current and scheduled cards. The API
+    exposes q=live and default details live+finished, so those modes must not
+    return rows that the parser already identified as upcoming. q=current keeps
+    the raw BO3 current-page behavior for backwards compatibility.
+    """
+    requested = (q_norm or "current").lower().strip()
+    if requested == "results":
+        requested = "finished"
+
+    if requested == "live":
+        return [item for item in segments if (item.get("status") or "").lower() == "live"]
+
+    if requested in {"upcoming", "schedule"}:
+        return [
+            item for item in segments
+            if (item.get("status") or "").lower() in {"upcoming", "scheduled"}
+        ]
+
+    if requested == "finished":
+        return [
+            item for item in segments
+            if (item.get("status") or "").lower() == "finished" and segment_has_real_result(item)
+        ]
+
+    # q=current intentionally means BO3's current page, which may include live
+    # and scheduled rows. Use q=live when callers need only live games.
+    return segments
 
 
 def status_from_detail_lines(lines: List[str]) -> str:
@@ -1484,6 +1526,15 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
     match = dict(data.get("match") or {})
     maps = list(data.get("maps") or [])
 
+    # Upcoming/scheduled cards can contain BO3 prediction widgets that look like
+    # scores. If an upcoming row reaches detail mode, do not expose those as
+    # verifier-safe results.
+    if (match.get("status") or "").lower() in {"upcoming", "scheduled"}:
+        match["score1"] = None
+        match["score2"] = None
+        match["winner"] = ""
+        maps = []
+
     # Keep map winner labels consistent with the final match team labels.  BO3
     # live/detail pages can abbreviate team names differently than list rows.
     team1 = match.get("team1", "") or ""
@@ -1562,12 +1613,16 @@ async def build_details_from_filters(
     # in API metadata because callers/verifiers reason about live vs finished.
     # Internally we still fetch "current" because that is the real BO3 path.
     if q_norm in {"", "all", "both", "live_finished", "live+finished", "current+finished"}:
-        query_plan = ["current", "finished"]
+        # Tuple shape: (BO3 fetch q, public/requested q, response label).
+        # BO3 fetches live rows from /matches/current, but that page also
+        # contains upcoming rows, so the requested q must stay "live".
+        query_plan = [("current", "live", "live"), ("finished", "finished", "finished")]
         display_query_plan = ["live", "finished"]
         query_label = "live+finished"
     else:
-        query_plan = [q_norm]
-        display_query_plan = ["live" if q_norm == "current" else q_norm]
+        fetch_q = "current" if q_norm == "live" else q_norm
+        query_plan = [(fetch_q, q_norm, "live" if q_norm == "current" else q_norm)]
+        display_query_plan = [query_plan[0][2]]
         query_label = display_query_plan[0]
 
     if max_results <= 0:
@@ -1579,20 +1634,21 @@ async def build_details_from_filters(
     render_modes: List[str] = []
     query_errors: Dict[str, str] = {}
 
-    for q_item in query_plan:
+    for fetch_q, requested_q, source_label in query_plan:
         try:
-            path, hint, ttl = match_list_path(canonical, q_item)
+            path, hint, ttl = match_list_path(canonical, fetch_q)
             raw = await fetch_html(path, ttl=ttl)
             parsed = parse_match_list(raw, hint)
             source_paths.append(path)
             render_modes.append(response_mode(raw))
-            for item in list(parsed.get("segments") or []):
+            scoped_segments = filter_segments_for_request(list(parsed.get("segments") or []), requested_q)
+            for item in scoped_segments:
                 item = dict(item)
-                item["source_query"] = "live" if q_item == "current" else q_item
+                item["source_query"] = source_label
                 item["source_path"] = path
                 all_rows.append(item)
         except Exception as exc:
-            query_errors[q_item] = str(exc)
+            query_errors[source_label] = str(exc)
 
     filtered = [
         item for item in all_rows
@@ -1759,7 +1815,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.0", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.1", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -1799,6 +1855,8 @@ async def match(
 
     raw = await fetch_html(path, ttl=ttl)
     data = parse_match_list(raw, hint)
+    data["segments"] = filter_segments_for_request(list(data.get("segments") or []), q_norm)
+    data["count"] = len(data["segments"])
     data["game"] = canonical
     data["source_path"] = path
     data["render_mode"] = response_mode(raw)
@@ -1816,6 +1874,8 @@ async def match_all(
             path, hint, ttl = match_list_path(canonical, q_norm)
             raw = await fetch_html(path, ttl=ttl)
             parsed = parse_match_list(raw, hint)
+            parsed["segments"] = filter_segments_for_request(list(parsed.get("segments") or []), q_norm)
+            parsed["count"] = len(parsed["segments"])
             parsed["game"] = canonical
             parsed["source_path"] = path
             parsed["render_mode"] = response_mode(raw)
@@ -1900,12 +1960,13 @@ async def search(
 ) -> Dict[str, Any]:
     source_norm = source.lower().strip()
     canonical = normalize_game(game)
-    path, hint, _ttl = match_list_path(canonical, "current" if source_norm in {"current", "live", "upcoming"} else "finished")
+    path, hint, _ttl = match_list_path(canonical, "current" if source_norm in {"current", "live", "upcoming", "schedule"} else "finished")
     raw = await fetch_html(path, ttl=30)
     data = parse_match_list(raw, hint)
+    scoped_segments = filter_segments_for_request(list(data.get("segments") or []), source_norm)
     q_fold = q.casefold()
     matches = []
-    for item in data["segments"]:
+    for item in scoped_segments:
         haystack = " ".join(
             [
                 item.get("raw_text", ""),
