@@ -793,16 +793,19 @@ def parse_match_list_from_visible_lines(raw_html: str, status_hint: str) -> List
     return segments
 
 
-def parse_match_list(raw_html: str, status_hint: str) -> Dict[str, Any]:
+def parse_match_list(raw_html: str, status_hint: str, include_unscored_finished: bool = False) -> Dict[str, Any]:
     segments = parse_match_list_from_anchors(raw_html, status_hint)
     if not segments:
         segments = parse_match_list_from_text(raw_html, status_hint)
     if not segments:
         segments = parse_match_list_from_visible_lines(raw_html, status_hint)
 
-    # BO3 sometimes mixes future/upcoming rows into the finished page.
-    # For verifier use, finished/results must only return rows with a real score.
-    if status_hint == "finished":
+    # BO3 finished/list cards sometimes expose only href/team/tournament text and
+    # leave the final score for the detail page. For plain list endpoints, keep
+    # the old safer behaviour and only return scored finished rows. For details
+    # and search endpoints, keep unscored finished candidates so we can fetch the
+    # detail page before deciding whether the match is truly finished.
+    if status_hint == "finished" and not include_unscored_finished:
         segments = [item for item in segments if segment_has_real_result(item)]
 
     return {"status": 200, "segments": segments, "count": len(segments)}
@@ -1687,17 +1690,17 @@ async def build_details_from_filters(
         try:
             path, hint, ttl = match_list_path(canonical, fetch_q)
             raw = await fetch_html(path, ttl=ttl)
-            parsed = parse_match_list(raw, hint)
+            parsed = parse_match_list(raw, hint, include_unscored_finished=True)
             source_paths.append(path)
             render_modes.append(response_mode(raw))
-            # For live/default details, keep BO3 current-page rows as detail
-            # candidates. The list card can say upcoming while the detail page
-            # already has the live/final state. We apply the strict requested
-            # status after fetching compact detail.
-            candidate_q = requested_q
-            if requested_q == "live":
-                candidate_q = "current"
-            scoped_segments = filter_segments_for_request(list(parsed.get("segments") or []), candidate_q)
+            # For details, list rows are only candidates. BO3 can label current
+            # rows as upcoming before the detail page moves to live/ended, and
+            # finished rows can omit the score on the list card. Apply the
+            # strict live/finished decision only after fetching compact detail.
+            if requested_q in {"live", "finished", "results"}:
+                scoped_segments = list(parsed.get("segments") or [])
+            else:
+                scoped_segments = filter_segments_for_request(list(parsed.get("segments") or []), requested_q)
             for item in scoped_segments:
                 item = dict(item)
                 item["source_query"] = source_label
@@ -1878,7 +1881,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.2", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.3", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -2025,8 +2028,13 @@ async def search(
     canonical = normalize_game(game)
     path, hint, _ttl = match_list_path(canonical, "current" if source_norm in {"current", "live", "upcoming", "schedule"} else "finished")
     raw = await fetch_html(path, ttl=30)
-    data = parse_match_list(raw, hint)
-    scoped_segments = filter_segments_for_request(list(data.get("segments") or []), source_norm)
+    data = parse_match_list(raw, hint, include_unscored_finished=True)
+    if source_norm in {"finished", "results"}:
+        # Search should be able to find finished-page candidates even when the
+        # score is only available after opening the detail page.
+        scoped_segments = list(data.get("segments") or [])
+    else:
+        scoped_segments = filter_segments_for_request(list(data.get("segments") or []), source_norm)
     q_fold = q.casefold()
     matches = []
     for item in scoped_segments:
