@@ -1383,15 +1383,29 @@ def filter_segments_for_request(segments: List[Dict[str, Any]], q_norm: str) -> 
 
 
 def status_from_detail_lines(lines: List[str]) -> str:
-    top = "\n".join(lines[:60]).lower()
-    if re.search(r"\blive\b", top):
-        return "live"
-    if re.search(r"\b(ended|finished|completed|complete)\b", top):
+    top_lines = [collapse_ws(x).lower() for x in lines[:60]]
+    top = "\n".join(top_lines)
+
+    # BO3 match pages often include generic SEO copy such as "live scores" even
+    # on completed match pages.  Finished/cancelled labels and final scores must
+    # win before any live detection, otherwise /details?q=finished can be
+    # returned with match.status="live".
+    if re.search(r"\b(ended|finished|completed|complete|full time|final)\b", top):
         return "finished"
     if re.search(r"\bpostponed\b", top):
         return "postponed"
     if re.search(r"\bcancelled|canceled\b", top):
         return "cancelled"
+
+    # Treat "live" as a status only when it appears as its own short label, not
+    # when it is part of generic page text like "live score" / "live scores".
+    for line in top_lines:
+        if line in {"live", "match live"}:
+            return "live"
+        if re.fullmatch(r"live(?:\s+now|\s+match)?", line):
+            return "live"
+        if re.search(r"\bstatus\s*[:：-]\s*live\b", line):
+            return "live"
     return "unknown"
 
 
@@ -1950,13 +1964,18 @@ def merge_detail_with_list_item(data: Dict[str, Any], item: Dict[str, Any]) -> D
     if item.get("team2"):
         match["team2"] = item.get("team2")
 
-    # Detail-page status is more authoritative than the mixed list page. BO3's
-    # /matches/current list can keep rows labelled as upcoming even after the
-    # detail page has moved to live/ended. Only use list status as a fallback
-    # when the detail page is unknown/empty.
+    # Detail-page status is usually more authoritative than BO3's mixed current
+    # list, but the detail parser must not let generic "live scores" SEO text
+    # override a finished list/API row with a real score.
     detail_status = (match.get("status") or "").lower()
     list_status = (item.get("status") or "").lower()
-    if detail_status in {"", "unknown"} and list_status:
+    if list_status == "finished" and has_list_score:
+        match["status"] = "finished"
+    elif list_status in {"upcoming", "scheduled"} and not has_list_score and detail_status == "live":
+        # Avoid turning future schedule cards into fake live matches just because
+        # the page contains generic "live score" wording.
+        match["status"] = list_status
+    elif detail_status in {"", "unknown"} and list_status:
         match["status"] = list_status
     elif detail_status in {"upcoming", "scheduled"} and list_status in {"live", "finished"}:
         match["status"] = list_status
@@ -2074,6 +2093,29 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
     match = dict(data.get("match") or {})
     maps = list(data.get("maps") or [])
 
+    source_status = ((source_row or {}).get("status") or "").lower()
+    source_has_result = bool(
+        source_row
+        and source_row.get("score1") is not None
+        and source_row.get("score2") is not None
+        and source_row.get("winner")
+    )
+    if source_status == "finished" and source_has_result:
+        # The BO3 API/list row was fetched with finished status and has a real
+        # series score.  Do not let detail-page SEO text label it as live.
+        match["status"] = "finished"
+
+    score1 = match.get("score1")
+    score2 = match.get("score2")
+    if score1 is not None and score2 is not None:
+        try:
+            if max(int(score1), int(score2)) >= 3:
+                match["bo"] = "bo5"
+            elif not match.get("bo") and (match.get("status") or "").lower() == "finished":
+                match["bo"] = infer_bo_from_series(score1, score2, maps)
+        except Exception:
+            pass
+
     # Upcoming/scheduled cards can contain BO3 prediction widgets that look like
     # scores. If an upcoming row reaches detail mode, do not expose those as
     # verifier-safe results.
@@ -2103,6 +2145,20 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
             "score2": score2,
             "winner": winner or mp.get("winner", "") or "",
         })
+
+    # If detail-page map parsing conflicts with the authoritative finished
+    # series score, drop map rows rather than publishing wrong game winners.
+    if (match.get("status") or "").lower() == "finished" and cleaned_maps:
+        try:
+            m_s1 = int(match.get("score1")) if match.get("score1") is not None else None
+            m_s2 = int(match.get("score2")) if match.get("score2") is not None else None
+        except Exception:
+            m_s1 = m_s2 = None
+        if m_s1 is not None and m_s2 is not None:
+            w1 = sum(1 for mp in cleaned_maps if (mp.get("winner") or "") == team1)
+            w2 = sum(1 for mp in cleaned_maps if (mp.get("winner") or "") == team2)
+            if (w1, w2) != (m_s1, m_s2):
+                cleaned_maps = []
 
     match["map_count"] = len(cleaned_maps)
     match["map_winners"] = [
@@ -2409,7 +2465,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.6", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.7", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
