@@ -1164,11 +1164,16 @@ async def fetch_match_list_from_api_v1(game: str, q_norm: str, status_hint: str)
     # payload markers before accepting results for prefixed games like LoL.
     for disc_id in DISCIPLINE_ID_CANDIDATES.get(canonical, [])[:12]:
         for status_value in status_values:
+            # Match BO3's public results pages more closely: finished pages are
+            # grouped by most-recent date first, then tier.  The old
+            # tier-first sort could return older S-tier CS2 finals before
+            # today's lower-tier finished matches.
+            sort_value = "-start_date,tier_rank" if status_hint == "finished" else "tier_rank,-start_date"
             params = {
                 "scope": "widget-matches",
                 "page[offset]": "0",
                 "page[limit]": "100",
-                "sort": "tier_rank,-start_date",
+                "sort": sort_value,
                 "filter[matches.status][in]": status_value,
                 "filter[matches.discipline_id][eq]": str(disc_id),
                 "with": "teams,tournament,ai_predictions,games,streams",
@@ -2105,6 +2110,20 @@ def compact_detail_payload(data: Dict[str, Any], source_row: Optional[Dict[str, 
         # series score.  Do not let detail-page SEO text label it as live.
         match["status"] = "finished"
 
+    # BO3's /matches/current list is "Schedule and Live".  The detail page can
+    # contain generic SEO words like "finished" / "live scores" and fake
+    # prediction snippets, so an unscored upcoming list row must remain upcoming
+    # unless BO3 gives an actual series result.  This prevents default
+    # live+finished from leaking tomorrow's scheduled games as finished/live.
+    source_is_unscored_upcoming = source_status in {"upcoming", "scheduled"} and not source_has_result
+    match_has_result_now = (
+        match.get("score1") is not None
+        and match.get("score2") is not None
+        and bool(match.get("winner"))
+    )
+    if source_is_unscored_upcoming and not match_has_result_now:
+        match["status"] = source_status
+
     score1 = match.get("score1")
     score2 = match.get("score2")
     if score1 is not None and score2 is not None:
@@ -2229,9 +2248,12 @@ def compact_payload_matches_request(payload: Dict[str, Any], requested: str) -> 
     if req in {"upcoming", "schedule"}:
         return status in {"upcoming", "scheduled"}
     if req == "finished":
-        return status == "finished" or (has_result and status not in {"upcoming", "scheduled"})
+        # Finished endpoints should only expose verifier-safe completed results.
+        return status == "finished" and has_result
     if req == "live+finished":
-        return status == "live" or status == "finished" or (has_result and status not in {"upcoming", "scheduled"})
+        # Do not include schedule/upcoming cards misparsed as finished unless
+        # they have a real completed score.
+        return status == "live" or (status == "finished" and has_result)
     return True
 
 
@@ -2465,7 +2487,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.7", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.8", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
