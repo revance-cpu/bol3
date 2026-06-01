@@ -107,6 +107,16 @@ GAME_API_SLUGS = {
     "mlbb": ["mlbb", "mobile-legends", "mobilelegends"],
 }
 
+# Extra raw-text markers used to avoid accepting the wrong discipline when BO3
+# changes numeric IDs.  CS2 is root and does not need markers.
+GAME_API_RAW_MARKERS = {
+    "valorant": ["valorant", "vct", "challengers"],
+    "r6s": ["r6siege", "rainbow", "siege"],
+    "dota2": ["dota2", "dota"],
+    "lol": ["/lol/", "-lol", "league of legends", "league-of-legends", "lcs", "lec", "lck", "lpl", "cblol", "lol"],
+    "mlbb": ["mlbb", "mobile legends", "mobile-legends"],
+}
+
 GAME_PREFIX_PATTERN = r"(?:valorant|r6siege|dota2|lol|mlbb)"
 
 # Do not request br/zstd. Vercel's Python runtime + httpx can behave differently
@@ -123,6 +133,22 @@ HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
+}
+
+# BO3's browser app reads match rows from the API host.  The plain
+# bo3.gg HTML can be an SEO/crawler page that has article text but not the
+# hydrated match table, especially for /lol/matches/finished.
+API_V1_BASE_URL = "https://api.bo3.gg/api/v1"
+API_V1_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Origin": "https://bo3.gg",
+    "Referer": "https://bo3.gg/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
 # BO3.gg/Nuxt can return an empty client-side shell to normal server-side
@@ -956,6 +982,25 @@ def _extract_api_score(obj: Dict[str, Any]) -> Tuple[Optional[int], Optional[int
         b = as_int(_first_present(score, ["team2", "score2", "away", "second", "b", "right"]))
         if a is not None and b is not None:
             return a, b
+
+    # BO3 API v1 often nests series scores on the two team objects instead of
+    # exposing score1/score2 on the match object.
+    for key in ("teams", "opponents", "participants", "competitors"):
+        teams = obj.get(key)
+        if isinstance(teams, list) and len(teams) >= 2:
+            vals: List[Optional[int]] = []
+            for team_obj in teams[:2]:
+                if isinstance(team_obj, dict):
+                    vals.append(as_int(_first_present(team_obj, [
+                        "score", "match_score", "matchScore", "series_score", "seriesScore",
+                        "games_won", "gamesWon", "maps_won", "mapsWon", "result",
+                        "points", "wins", "team_score", "teamScore",
+                    ])))
+                else:
+                    vals.append(as_int(team_obj))
+            if len(vals) >= 2 and vals[0] is not None and vals[1] is not None:
+                return vals[0], vals[1]
+
     return None, None
 
 
@@ -1080,14 +1125,113 @@ def parse_match_list_from_api_json(raw_text: str, game: str, status_hint: str) -
     return out
 
 
+def _api_raw_looks_like_game(raw_text: str, game: str) -> bool:
+    """Guard against accepting the wrong BO3 discipline ID.
+
+    BO3's numeric discipline IDs have changed before.  For prefixed games, the
+    API payload normally contains game-specific slugs such as -lol or /lol/. If
+    those markers are absent, skip that candidate instead of accidentally
+    rescoping CS2 root slugs into /lol/matches/... .
+    """
+    canonical = normalize_game(game)
+    if canonical == "cs2":
+        return True
+    lower = (raw_text or "").casefold()
+    markers = GAME_API_RAW_MARKERS.get(canonical) or GAME_API_SLUGS.get(canonical) or [canonical]
+    return any(marker.casefold() in lower for marker in markers)
+
+
+async def fetch_match_list_from_api_v1(game: str, q_norm: str, status_hint: str) -> Tuple[Dict[str, Any], str]:
+    """Use BO3's real browser API host as the primary JSON fallback.
+
+    The public HTML page can be SEO-only in serverless fetches.  BO3's own
+    browser client reads /api/v1/matches from api.bo3.gg with filters such as
+    filter[matches.status][in]=finished and filter[matches.discipline_id][eq]=N.
+    """
+    canonical = normalize_game(game)
+    if q_norm in {"finished", "results"}:
+        status_values = ["finished", "finished,defwin"]
+    elif q_norm in {"schedule", "upcoming"}:
+        status_values = ["upcoming"]
+    else:
+        status_values = ["current"]
+
+    client = await get_client()
+    errors: List[str] = []
+    seen_urls = set()
+
+    # Try the most likely discipline IDs first, but validate the returned raw
+    # payload markers before accepting results for prefixed games like LoL.
+    for disc_id in DISCIPLINE_ID_CANDIDATES.get(canonical, [])[:12]:
+        for status_value in status_values:
+            params = {
+                "scope": "widget-matches",
+                "page[offset]": "0",
+                "page[limit]": "100",
+                "sort": "tier_rank,-start_date",
+                "filter[matches.status][in]": status_value,
+                "filter[matches.discipline_id][eq]": str(disc_id),
+                "with": "teams,tournament,ai_predictions,games,streams",
+            }
+            url = API_V1_BASE_URL + "/matches?" + urlencode(params)
+            now = time.time()
+            cached = _cache.get(url)
+            if cached and now - cached.ts <= 60:
+                raw = cached.value
+            else:
+                try:
+                    resp = await client.get(url, headers=API_V1_HEADERS)
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        delay = float(retry_after) if retry_after and retry_after.isdigit() else 1.5
+                        await asyncio.sleep(min(delay, 8.0))
+                        resp = await client.get(url, headers=API_V1_HEADERS)
+                    resp.raise_for_status()
+                    raw = resp.text or ""
+                    _cache[url] = CacheEntry(time.time(), raw)
+                except Exception as exc:
+                    if len(errors) < 3:
+                        errors.append("%s: %s" % (url, exc))
+                    continue
+
+            if not raw.strip():
+                continue
+            if not _api_raw_looks_like_game(raw, canonical):
+                continue
+
+            segments = parse_match_list_from_api_json(raw, canonical, status_hint)
+            if not segments:
+                continue
+
+            deduped: List[Dict[str, Any]] = []
+            for item in segments:
+                key = canonical_match_path(urlparse(item.get("url", "")).path).rstrip("/")
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                item = dict(item)
+                item["api_source_path"] = url
+                item["api_discipline_id"] = str(disc_id)
+                deduped.append(item)
+
+            if deduped:
+                return {"status": 200, "segments": deduped, "count": len(deduped)}, url
+
+    if errors:
+        return {"status": 502, "segments": [], "count": 0, "error": " | ".join(errors)}, ""
+    return {"status": 200, "segments": [], "count": 0}, ""
+
+
 async def fetch_match_list_from_api(game: str, q_norm: str, status_hint: str) -> Tuple[Dict[str, Any], str]:
     """Fallback for BO3 pages whose HTML no longer contains match cards.
 
-    BO3 still exposes a JSON list endpoint used by older browser builds and
-    public scrapers.  Parameters have changed over time, so this intentionally
-    tries a small set of compatible forms and keeps only URLs in the requested
-    game namespace.
+    Prefer BO3's real api.bo3.gg v1 browser endpoint.  Keep the older /api/v2
+    guesses as a final compatibility fallback.
     """
+    api_v1_data, api_v1_path = await fetch_match_list_from_api_v1(game, q_norm, status_hint)
+    if api_v1_data.get("segments"):
+        return api_v1_data, api_v1_path
+
     state = "finished" if q_norm in {"finished", "results"} else "current"
     prefix = game_prefix(game)
 
@@ -1179,7 +1323,15 @@ async def fetch_match_list_data(game: str, q_norm: str, include_unscored_finishe
     mode = response_mode(raw)
 
     # If BO3's SSR/HTML page returns only SEO text, use the browser JSON API.
-    if not data.get("segments"):
+    # Also do this for finished pages when the HTML parser only saw bare URLs
+    # without a real result. Otherwise /details?q=finished can fetch detail
+    # pages from unscored candidates and filter everything back to zero.
+    segments_now = list(data.get("segments") or [])
+    needs_api_fallback = not segments_now
+    if hint == "finished" and not any(segment_has_real_result(item) for item in segments_now):
+        needs_api_fallback = True
+
+    if needs_api_fallback:
         api_data, api_path = await fetch_match_list_from_api(canonical, q_norm, hint)
         if api_data.get("segments"):
             data = api_data
@@ -2257,7 +2409,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.5", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.6", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
