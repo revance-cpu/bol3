@@ -87,12 +87,15 @@ PREFIX_TO_GAME = {"": "cs2", "/valorant": "valorant", "/r6siege": "r6s", "/dota2
 # first and then a small safe range, filtering the returned URLs back to the
 # requested game namespace.
 DISCIPLINE_ID_CANDIDATES = {
+    # CS2 is BO3's root namespace and uses discipline_id=1 in public scrape
+    # examples. The other game IDs have changed before, so keep a bounded
+    # fallback range for non-CS2 games instead of assuming one fixed value.
     "cs2": [1, 2, 3, 4, 5, 6, 7, 8],
-    "valorant": [2, 3, 4, 5, 6, 7, 8, 1],
-    "r6s": [3, 4, 5, 6, 7, 8, 1, 2],
-    "dota2": [4, 3, 5, 6, 7, 8, 1, 2],
-    "lol": [5, 4, 6, 3, 7, 8, 1, 2],
-    "mlbb": [6, 5, 7, 4, 8, 3, 1, 2],
+    "valorant": [2, 3, 4, 5, 6, 7, 8, 9, 10, 1],
+    "r6s": [3, 4, 5, 6, 7, 8, 9, 10, 1, 2],
+    "dota2": [4, 3, 5, 6, 7, 8, 9, 10, 1, 2],
+    "lol": [5, 4, 6, 3, 7, 8, 9, 10, 11, 12, 1, 2],
+    "mlbb": [6, 5, 7, 4, 8, 9, 10, 11, 12, 3, 1, 2],
 }
 
 GAME_API_SLUGS = {
@@ -100,7 +103,7 @@ GAME_API_SLUGS = {
     "valorant": ["valorant"],
     "r6s": ["r6siege", "r6s", "rainbow-six", "rainbowsix"],
     "dota2": ["dota2", "dota"],
-    "lol": ["lol", "league-of-legends", "leagueoflegends"],
+    "lol": ["lol", "league-of-legends", "leagueoflegends", "league_of_legends"],
     "mlbb": ["mlbb", "mobile-legends", "mobilelegends"],
 }
 
@@ -388,6 +391,37 @@ def abs_bo3_url(href: str) -> str:
     if href.startswith("/"):
         return urljoin(BASE_URL, href)
     return href
+
+
+def scope_root_match_url_for_game(url_or_path: str, game: str) -> str:
+    """Attach the game namespace when BO3 gives a root /matches URL.
+
+    CS2 lives at /matches/... with no /cs2 prefix. Other games live under
+    /lol/matches, /valorant/matches, etc. Some BO3 JSON/client payloads are
+    game-scoped but still return root-looking /matches/<slug> paths; without
+    this correction LoL/Valorant/R6/Dota/MLBB candidates get misclassified as
+    CS2 and dropped.
+    """
+    value = (url_or_path or "").strip()
+    if not value:
+        return value
+    full = abs_bo3_url(value)
+    parsed = urlparse(full)
+    path = canonical_match_path(parsed.path)
+    prefix = game_prefix(game)
+    if prefix and re.fullmatch(r"/matches/[^/]+", path, flags=re.I):
+        return urljoin(BASE_URL, prefix + path)
+    return full
+
+
+def normalize_segment_url_for_game(item: Dict[str, Any], game: str) -> Dict[str, Any]:
+    if not item:
+        return item
+    out = dict(item)
+    url = out.get("url", "") or ""
+    if url:
+        out["url"] = scope_root_match_url_for_game(url, game)
+    return out
 
 
 def canonical_match_path(path: str) -> str:
@@ -947,7 +981,7 @@ def _api_match_url(obj: Dict[str, Any], game: str) -> str:
     if value:
         value = str(value)
         if "/matches/" in value:
-            return abs_bo3_url(value)
+            return scope_root_match_url_for_game(value, game)
 
     slug = _first_present(obj, ["slug", "match_slug", "matchSlug", "seo_slug", "seoSlug"])
     if slug:
@@ -1055,33 +1089,54 @@ async def fetch_match_list_from_api(game: str, q_norm: str, status_hint: str) ->
     game namespace.
     """
     state = "finished" if q_norm in {"finished", "results"} else "current"
-    # Public scrape examples and the web app both point at this root API path.
-    # Keep the fallback bounded so one bad parameter shape does not stall Vercel.
-    base_paths = ["/api/v2/matches/" + state]
+    prefix = game_prefix(game)
+
+    # CS2 is BO3's root namespace: /matches/finished and /api/v2/matches/finished.
+    # Other games use a URL prefix for HTML (/lol/matches/finished). BO3 has also
+    # served game-scoped API paths on some builds, so try those before the shared
+    # root API. Results are still filtered back to the requested namespace.
+    base_paths: List[str] = []
+    if prefix:
+        base_paths.append(prefix + "/api/v2/matches/" + state)
+        base_paths.append("/api/v2" + prefix + "/matches/" + state)
+    base_paths.append("/api/v2/matches/" + state)
 
     today = datetime.utcnow().date()
-    date_window = {
-        "from_date": (today - timedelta(days=7)).isoformat(),
-        "to_date": (today + timedelta(days=1)).isoformat(),
-    }
+    from_date = (today - timedelta(days=7)).isoformat()
+    to_date = (today + timedelta(days=1)).isoformat()
+    date_windows = [
+        {"from_date": from_date, "to_date": to_date},
+        {"date_from": from_date, "date_to": to_date},
+        {"start_date": from_date, "end_date": to_date},
+    ]
 
     query_sets: List[Dict[str, Any]] = []
+    seen_query_keys = set()
 
     def add_query(params: Dict[str, Any]) -> None:
-        base = dict(params)
-        base.setdefault("page", "1")
-        base.setdefault("utc_offset", "0")
-        query_sets.append(base)
-        with_dates = dict(base)
-        with_dates.update(date_window)
-        query_sets.append(with_dates)
+        variants = [dict(params)]
+        for win in date_windows:
+            dated = dict(params)
+            dated.update(win)
+            variants.append(dated)
+        for variant in variants:
+            variant.setdefault("page", "1")
+            variant.setdefault("utc_offset", "0")
+            key = tuple(sorted((str(k), str(v)) for k, v in variant.items()))
+            if key in seen_query_keys:
+                continue
+            seen_query_keys.add(key)
+            query_sets.append(variant)
 
     add_query({})
-    for slug in GAME_API_SLUGS.get(game, [game])[:2]:
+    for slug in GAME_API_SLUGS.get(game, [game])[:4]:
         add_query({"game": slug})
         add_query({"discipline": slug})
-    for disc_id in DISCIPLINE_ID_CANDIDATES.get(game, [])[:8]:
+        add_query({"discipline_slug": slug})
+    for disc_id in DISCIPLINE_ID_CANDIDATES.get(game, [])[:12]:
         add_query({"discipline_id": str(disc_id)})
+        add_query({"disciplineId": str(disc_id)})
+        add_query({"discipline": str(disc_id)})
 
     errors: List[str] = []
     seen_urls = set()
@@ -1118,6 +1173,8 @@ async def fetch_match_list_data(game: str, q_norm: str, include_unscored_finishe
     path, hint, ttl = match_list_path(canonical, q_norm)
     raw = await fetch_html(path, ttl=ttl)
     data = parse_match_list(raw, hint, include_unscored_finished=include_unscored_finished)
+    data["segments"] = [normalize_segment_url_for_game(item, canonical) for item in (data.get("segments") or [])]
+    data["count"] = len(data.get("segments") or [])
     source_path = path
     mode = response_mode(raw)
 
@@ -2200,7 +2257,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.4", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.5", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
