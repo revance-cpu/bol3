@@ -849,14 +849,14 @@ def filter_segments_for_request(segments: List[Dict[str, Any]], q_norm: str) -> 
 
 
 def status_from_detail_lines(lines: List[str]) -> str:
-    top = "\n".join(lines[:35]).lower()
+    top = "\n".join(lines[:60]).lower()
     if re.search(r"\blive\b", top):
         return "live"
-    if re.search(r"\bended\b", top):
+    if re.search(r"\b(ended|finished|completed|complete)\b", top):
         return "finished"
     if re.search(r"\bpostponed\b", top):
         return "postponed"
-    if re.search(r"\bcancelled\b", top):
+    if re.search(r"\bcancelled|canceled\b", top):
         return "cancelled"
     return "unknown"
 
@@ -1355,6 +1355,10 @@ def parse_match_detail(raw_html: str, source_url: str) -> Dict[str, Any]:
 
     status = status_from_detail_lines(lines)
     series = parse_series_score(lines, visible, team1, team2)
+    if status == "unknown" and series.get("score1") is not None and series.get("score2") is not None and series.get("winner"):
+        # BO3 sometimes omits an explicit "Ended" label from prerendered
+        # detail HTML even though the header contains the final series score.
+        status = "finished"
     bo_from_page = parse_bo_from_lines(lines)
     maps = parse_map_scores(lines, visible, raw_html, team1, team2)
     maps = trim_maps_for_series(maps, series["score1"], series["score2"], bo_from_page)
@@ -1411,12 +1415,24 @@ def merge_detail_with_list_item(data: Dict[str, Any], item: Dict[str, Any]) -> D
         match["team1"] = item.get("team1")
     if item.get("team2"):
         match["team2"] = item.get("team2")
-    if item.get("status"):
-        match["status"] = item.get("status")
+
+    # Detail-page status is more authoritative than the mixed list page. BO3's
+    # /matches/current list can keep rows labelled as upcoming even after the
+    # detail page has moved to live/ended. Only use list status as a fallback
+    # when the detail page is unknown/empty.
+    detail_status = (match.get("status") or "").lower()
+    list_status = (item.get("status") or "").lower()
+    if detail_status in {"", "unknown"} and list_status:
+        match["status"] = list_status
+    elif detail_status in {"upcoming", "scheduled"} and list_status in {"live", "finished"}:
+        match["status"] = list_status
+
     if item.get("bo"):
         match["bo"] = item.get("bo")
 
-    if has_list_score:
+    # Never let a scheduled/current-card prediction tail overwrite detail data.
+    # List scores are safe only from finished/live rows.
+    if has_list_score and list_status not in {"upcoming", "scheduled"}:
         match["score1"] = score1
         match["score2"] = score2
         match["winner"] = item.get("winner", "")
@@ -1598,6 +1614,39 @@ async def fetch_compact_detail_for_item(item: Dict[str, Any], game: str) -> Dict
     return compact
 
 
+def compact_payload_has_real_result(payload: Dict[str, Any]) -> bool:
+    match = payload.get("match") or {}
+    return (
+        match.get("score1") is not None
+        and match.get("score2") is not None
+        and bool(match.get("winner"))
+    )
+
+
+def compact_payload_matches_request(payload: Dict[str, Any], requested: str) -> bool:
+    req = (requested or "current").lower().strip()
+    if req in {"", "all", "both", "live_finished", "live+finished", "current+finished"}:
+        req = "live+finished"
+    if req == "results":
+        req = "finished"
+
+    match = payload.get("match") or {}
+    status = (match.get("status") or "").lower()
+    has_result = compact_payload_has_real_result(payload)
+
+    if req == "current":
+        return True
+    if req == "live":
+        return status == "live"
+    if req in {"upcoming", "schedule"}:
+        return status in {"upcoming", "scheduled"}
+    if req == "finished":
+        return status == "finished" or (has_result and status not in {"upcoming", "scheduled"})
+    if req == "live+finished":
+        return status == "live" or status == "finished" or (has_result and status not in {"upcoming", "scheduled"})
+    return True
+
+
 async def build_details_from_filters(
     q: str,
     game: str,
@@ -1641,7 +1690,14 @@ async def build_details_from_filters(
             parsed = parse_match_list(raw, hint)
             source_paths.append(path)
             render_modes.append(response_mode(raw))
-            scoped_segments = filter_segments_for_request(list(parsed.get("segments") or []), requested_q)
+            # For live/default details, keep BO3 current-page rows as detail
+            # candidates. The list card can say upcoming while the detail page
+            # already has the live/final state. We apply the strict requested
+            # status after fetching compact detail.
+            candidate_q = requested_q
+            if requested_q == "live":
+                candidate_q = "current"
+            scoped_segments = filter_segments_for_request(list(parsed.get("segments") or []), candidate_q)
             for item in scoped_segments:
                 item = dict(item)
                 item["source_query"] = source_label
@@ -1675,7 +1731,12 @@ async def build_details_from_filters(
         seen_urls.add(key)
         deduped_rows.append(item)
 
-    deduped_rows = deduped_rows[:max_results]
+    # Candidate rows can be mislabelled on BO3's mixed current page, so fetch a
+    # few extra detail pages and then trim after the detail-status filter.
+    candidate_limit = max_results
+    if q_norm in {"", "all", "both", "live_finished", "live+finished", "current+finished", "live", "finished", "results"}:
+        candidate_limit = min(80, max(max_results * 4, 20))
+    deduped_rows = deduped_rows[:candidate_limit]
 
     sem = asyncio.Semaphore(6)
 
@@ -1702,6 +1763,8 @@ async def build_details_from_filters(
                 }
 
     matches = await asyncio.gather(*[guarded(item) for item in deduped_rows]) if deduped_rows else []
+    matches = [m for m in matches if compact_payload_matches_request(m, q_norm)]
+    matches = matches[:max_results]
 
     render_mode = "+".join(sorted(set(render_modes))) if render_modes else "unknown"
     return {
@@ -1815,7 +1878,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.1", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.2", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
