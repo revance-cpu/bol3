@@ -28,10 +28,11 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 import uvicorn
@@ -79,6 +80,30 @@ CANONICAL_GAMES = {
 }
 
 PREFIX_TO_GAME = {"": "cs2", "/valorant": "valorant", "/r6siege": "r6s", "/dota2": "dota2", "/lol": "lol", "/mlbb": "mlbb"}
+
+# BO3's rendered match pages are sometimes missing the actual match cards,
+# while the browser still loads them from BO3's JSON API.  The exact numeric
+# discipline IDs have moved before, so the fallback tries the likely primary ID
+# first and then a small safe range, filtering the returned URLs back to the
+# requested game namespace.
+DISCIPLINE_ID_CANDIDATES = {
+    "cs2": [1, 2, 3, 4, 5, 6, 7, 8],
+    "valorant": [2, 3, 4, 5, 6, 7, 8, 1],
+    "r6s": [3, 4, 5, 6, 7, 8, 1, 2],
+    "dota2": [4, 3, 5, 6, 7, 8, 1, 2],
+    "lol": [5, 4, 6, 3, 7, 8, 1, 2],
+    "mlbb": [6, 5, 7, 4, 8, 3, 1, 2],
+}
+
+GAME_API_SLUGS = {
+    "cs2": ["cs2", "csgo", "counter-strike", "counterstrike"],
+    "valorant": ["valorant"],
+    "r6s": ["r6siege", "r6s", "rainbow-six", "rainbowsix"],
+    "dota2": ["dota2", "dota"],
+    "lol": ["lol", "league-of-legends", "leagueoflegends"],
+    "mlbb": ["mlbb", "mobile-legends", "mobilelegends"],
+}
+
 GAME_PREFIX_PATTERN = r"(?:valorant|r6siege|dota2|lol|mlbb)"
 
 # Do not request br/zstd. Vercel's Python runtime + httpx can behave differently
@@ -811,6 +836,303 @@ def parse_match_list(raw_html: str, status_hint: str, include_unscored_finished:
     return {"status": 200, "segments": segments, "count": len(segments)}
 
 
+
+def _first_present(obj: Dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key in obj and obj.get(key) not in (None, ""):
+            return obj.get(key)
+    return None
+
+
+def _nested_name(value: Any) -> str:
+    if isinstance(value, str):
+        return collapse_ws(value)
+    if isinstance(value, dict):
+        for key in ("name", "title", "short_name", "shortName", "name_en", "full_name", "fullName", "slug"):
+            if value.get(key) not in (None, ""):
+                if key == "slug":
+                    return slug_to_name(str(value.get(key)))
+                return collapse_ws(str(value.get(key)))
+        for key in ("team", "participant", "opponent"):
+            nested = _nested_name(value.get(key))
+            if nested:
+                return nested
+    return ""
+
+
+def _extract_api_teams(obj: Dict[str, Any], url: str) -> Tuple[str, str]:
+    team1 = _nested_name(_first_present(obj, [
+        "team1", "team_1", "teamA", "team_a", "home", "homeTeam", "home_team",
+        "firstTeam", "first_team", "opponent1", "opponent_1", "participant1", "participant_1",
+    ]))
+    team2 = _nested_name(_first_present(obj, [
+        "team2", "team_2", "teamB", "team_b", "away", "awayTeam", "away_team",
+        "secondTeam", "second_team", "opponent2", "opponent_2", "participant2", "participant_2",
+    ]))
+
+    if not (team1 and team2):
+        for key in ("teams", "opponents", "participants", "competitors"):
+            value = obj.get(key)
+            if isinstance(value, list) and len(value) >= 2:
+                names = [_nested_name(x) for x in value]
+                names = [x for x in names if x]
+                if len(names) >= 2:
+                    team1 = team1 or names[0]
+                    team2 = team2 or names[1]
+                    break
+
+    if not (team1 and team2) and url:
+        team1, team2 = teams_from_match_slug(url)
+    return team1, team2
+
+
+def _extract_api_score(obj: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    def as_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except Exception:
+            m = re.search(r"\d+", str(value))
+            return int(m.group(0)) if m else None
+
+    s1 = as_int(_first_present(obj, [
+        "score1", "score_1", "team1_score", "team1Score", "home_score", "homeScore",
+        "first_score", "firstScore", "scoreTeam1", "firstTeamScore",
+    ]))
+    s2 = as_int(_first_present(obj, [
+        "score2", "score_2", "team2_score", "team2Score", "away_score", "awayScore",
+        "second_score", "secondScore", "scoreTeam2", "secondTeamScore",
+    ]))
+    if s1 is not None and s2 is not None:
+        return s1, s2
+
+    score = obj.get("score") or obj.get("scores") or obj.get("result")
+    if isinstance(score, str):
+        parsed = parse_score(score)
+        if parsed:
+            return parsed
+    if isinstance(score, list) and len(score) >= 2:
+        a = as_int(score[0])
+        b = as_int(score[1])
+        if a is not None and b is not None:
+            return a, b
+    if isinstance(score, dict):
+        a = as_int(_first_present(score, ["team1", "score1", "home", "first", "a", "left"]))
+        b = as_int(_first_present(score, ["team2", "score2", "away", "second", "b", "right"]))
+        if a is not None and b is not None:
+            return a, b
+    return None, None
+
+
+def _normalize_api_status(value: Any, status_hint: str) -> str:
+    raw = collapse_ws(str(value or "")).casefold()
+    if raw in {"finished", "finish", "ended", "end", "done", "completed", "complete", "full", "past", "result", "results"}:
+        return "finished"
+    if raw in {"live", "current", "running", "ongoing", "in_progress", "in progress", "started"}:
+        return "live"
+    if raw in {"upcoming", "scheduled", "schedule", "not_started", "not started", "pending"}:
+        return "upcoming"
+    if re.search(r"\b(live|ongoing|in[ _-]?progress)\b", raw):
+        return "live"
+    if re.search(r"\b(ended|finished|completed|complete|full)\b", raw):
+        return "finished"
+    if re.search(r"\b(upcoming|scheduled|not[ _-]?started)\b", raw):
+        return "upcoming"
+    return infer_status_from_text(raw, status_hint)
+
+
+def _api_match_url(obj: Dict[str, Any], game: str) -> str:
+    value = _first_present(obj, ["url", "href", "link", "path", "match_url", "matchUrl", "page_url", "pageUrl"])
+    if value:
+        value = str(value)
+        if "/matches/" in value:
+            return abs_bo3_url(value)
+
+    slug = _first_present(obj, ["slug", "match_slug", "matchSlug", "seo_slug", "seoSlug"])
+    if slug:
+        slug = str(slug).strip("/")
+        if slug:
+            if "/matches/" in slug:
+                return abs_bo3_url("/" + slug)
+            return urljoin(BASE_URL, game_prefix(game) + "/matches/" + slug)
+    return ""
+
+
+def _api_item_is_for_game(url: str, game: str) -> bool:
+    if not url:
+        return False
+    path = canonical_match_path(urlparse(url).path).lower()
+    expected = game_prefix(game).lower()
+    if expected:
+        return path.startswith(expected + "/matches/")
+    # CS2 is the root namespace. Reject other explicit game namespaces.
+    return bool(re.match(r"^/matches/[^/]+$", path))
+
+
+def _iter_json_dicts(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            for item in _iter_json_dicts(child):
+                yield item
+    elif isinstance(value, list):
+        for child in value:
+            for item in _iter_json_dicts(child):
+                yield item
+
+
+def _api_obj_to_segment(obj: Dict[str, Any], game: str, status_hint: str) -> Optional[Dict[str, Any]]:
+    url = _api_match_url(obj, game)
+    if not url or not _api_item_is_for_game(url, game):
+        return None
+
+    team1, team2 = _extract_api_teams(obj, url)
+    if not (team1 and team2):
+        return None
+
+    score1, score2 = _extract_api_score(obj)
+    status = _normalize_api_status(_first_present(obj, ["status", "state", "stage", "match_status", "matchStatus", "type"]), status_hint)
+    if status == "finished" and (score1 is None or score2 is None):
+        # Keep it as a detail candidate. The detail page often has the score.
+        winner = ""
+    elif score1 is not None and score2 is not None:
+        winner = team1 if score1 > score2 else team2 if score2 > score1 else "draw"
+    else:
+        winner = ""
+
+    bo_raw = _first_present(obj, ["bo", "best_of", "bestOf", "format", "match_format", "matchFormat", "maps_count", "mapsCount"])
+    bo = ""
+    if bo_raw not in (None, ""):
+        m = re.search(r"([1357])", str(bo_raw))
+        if m:
+            bo = "bo" + m.group(1)
+
+    time_value = _first_present(obj, ["time", "date", "start_at", "startAt", "started_at", "startedAt", "scheduled_at", "scheduledAt", "begin_at", "beginAt"])
+    tournament = _nested_name(_first_present(obj, ["tournament", "event", "league", "championship"]))
+    raw_text = collapse_ws(" ".join(str(x) for x in [time_value or "", team1, bo, team2, score1 if score1 is not None else "", "-" if score1 is not None and score2 is not None else "", score2 if score2 is not None else "", tournament] if str(x) != ""))
+
+    return {
+        "raw_text": raw_text,
+        "status": status,
+        "time": collapse_ws(str(time_value or "")),
+        "bo": bo,
+        "team1": team1,
+        "team2": team2,
+        "score1": score1,
+        "score2": score2,
+        "winner": winner,
+        "url": url,
+    }
+
+
+def parse_match_list_from_api_json(raw_text: str, game: str, status_hint: str) -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(raw_text)
+    except Exception:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for obj in _iter_json_dicts(payload):
+        item = _api_obj_to_segment(obj, game, status_hint)
+        if not item:
+            continue
+        key = canonical_match_path(urlparse(item.get("url", "")).path).rstrip("/")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+async def fetch_match_list_from_api(game: str, q_norm: str, status_hint: str) -> Tuple[Dict[str, Any], str]:
+    """Fallback for BO3 pages whose HTML no longer contains match cards.
+
+    BO3 still exposes a JSON list endpoint used by older browser builds and
+    public scrapers.  Parameters have changed over time, so this intentionally
+    tries a small set of compatible forms and keeps only URLs in the requested
+    game namespace.
+    """
+    state = "finished" if q_norm in {"finished", "results"} else "current"
+    # Public scrape examples and the web app both point at this root API path.
+    # Keep the fallback bounded so one bad parameter shape does not stall Vercel.
+    base_paths = ["/api/v2/matches/" + state]
+
+    today = datetime.utcnow().date()
+    date_window = {
+        "from_date": (today - timedelta(days=7)).isoformat(),
+        "to_date": (today + timedelta(days=1)).isoformat(),
+    }
+
+    query_sets: List[Dict[str, Any]] = []
+
+    def add_query(params: Dict[str, Any]) -> None:
+        base = dict(params)
+        base.setdefault("page", "1")
+        base.setdefault("utc_offset", "0")
+        query_sets.append(base)
+        with_dates = dict(base)
+        with_dates.update(date_window)
+        query_sets.append(with_dates)
+
+    add_query({})
+    for slug in GAME_API_SLUGS.get(game, [game])[:2]:
+        add_query({"game": slug})
+        add_query({"discipline": slug})
+    for disc_id in DISCIPLINE_ID_CANDIDATES.get(game, [])[:8]:
+        add_query({"discipline_id": str(disc_id)})
+
+    errors: List[str] = []
+    seen_urls = set()
+    for base in base_paths:
+        for params in query_sets:
+            path = base + "?" + urlencode(params)
+            try:
+                raw = await fetch_html(path, ttl=60)
+                segments = parse_match_list_from_api_json(raw, game, status_hint)
+                if not segments:
+                    continue
+                deduped: List[Dict[str, Any]] = []
+                for item in segments:
+                    key = canonical_match_path(urlparse(item.get("url", "")).path).rstrip("/")
+                    if key in seen_urls:
+                        continue
+                    seen_urls.add(key)
+                    item = dict(item)
+                    item["api_source_path"] = path
+                    deduped.append(item)
+                if deduped:
+                    return {"status": 200, "segments": deduped, "count": len(deduped)}, path
+            except Exception as exc:
+                if len(errors) < 3:
+                    errors.append("%s: %s" % (path, exc))
+                continue
+    if errors:
+        return {"status": 502, "segments": [], "count": 0, "error": " | ".join(errors)}, ""
+    return {"status": 200, "segments": [], "count": 0}, ""
+
+
+async def fetch_match_list_data(game: str, q_norm: str, include_unscored_finished: bool = False) -> Tuple[Dict[str, Any], str, str, str, int]:
+    canonical = normalize_game(game)
+    path, hint, ttl = match_list_path(canonical, q_norm)
+    raw = await fetch_html(path, ttl=ttl)
+    data = parse_match_list(raw, hint, include_unscored_finished=include_unscored_finished)
+    source_path = path
+    mode = response_mode(raw)
+
+    # If BO3's SSR/HTML page returns only SEO text, use the browser JSON API.
+    if not data.get("segments"):
+        api_data, api_path = await fetch_match_list_from_api(canonical, q_norm, hint)
+        if api_data.get("segments"):
+            data = api_data
+            source_path = api_path or path
+            mode = "json-api"
+        elif api_data.get("error"):
+            data["api_error"] = api_data.get("error")
+
+    return data, source_path, mode, hint, ttl
+
 def segment_has_real_result(item: Dict[str, Any]) -> bool:
     return (
         item.get("score1") is not None
@@ -1461,9 +1783,7 @@ async def find_match_list_item_for_detail(full_url: str, game: str) -> Dict[str,
     candidates = []
     for q_norm in ("current", "finished"):
         try:
-            path, hint, ttl = match_list_path(game, q_norm)
-            raw = await fetch_html(path, ttl=ttl)
-            parsed = parse_match_list(raw, hint)
+            parsed, _source_path, _mode, _hint, _ttl = await fetch_match_list_data(game, q_norm, include_unscored_finished=True)
             candidates.extend(parsed.get("segments") or [])
         except Exception:
             continue
@@ -1688,11 +2008,10 @@ async def build_details_from_filters(
 
     for fetch_q, requested_q, source_label in query_plan:
         try:
-            path, hint, ttl = match_list_path(canonical, fetch_q)
-            raw = await fetch_html(path, ttl=ttl)
-            parsed = parse_match_list(raw, hint, include_unscored_finished=True)
-            source_paths.append(path)
-            render_modes.append(response_mode(raw))
+            parsed, source_path, mode, _hint, _ttl = await fetch_match_list_data(canonical, fetch_q, include_unscored_finished=True)
+            path = source_path
+            source_paths.append(source_path)
+            render_modes.append(mode)
             # For details, list rows are only candidates. BO3 can label current
             # rows as upcoming before the detail page moves to live/ended, and
             # finished rows can omit the score on the list card. Apply the
@@ -1881,7 +2200,7 @@ async def shutdown() -> None:
 
 @app.get("/version", tags=["Meta"])
 def version() -> Dict[str, str]:
-    return {"version": "0.6.3", "default_api": "v2", "source": "bo3.gg"}
+    return {"version": "0.6.4", "default_api": "v2", "source": "bo3.gg"}
 
 
 @app.get("/v2/games", tags=["Meta"])
@@ -1893,14 +2212,13 @@ def games() -> Dict[str, Any]:
 async def health(game: str = Query("cs2", description="cs2/valorant/r6s/dota2/lol/mlbb")) -> Dict[str, Any]:
     try:
         canonical = normalize_game(game)
-        raw = await fetch_html(game_prefix(canonical) + "/matches/current", ttl=10)
-        parsed = parse_match_list(raw, "current")
+        parsed, source_path, mode, _hint, _ttl = await fetch_match_list_data(canonical, "current")
         return {
             "status": "success",
             "upstream": "ok",
             "game": canonical,
-            "render_mode": response_mode(raw),
-            "bytes": len(raw),
+            "render_mode": mode,
+            "source_path": source_path,
             "match_count": parsed["count"],
         }
     except Exception as exc:
@@ -1919,13 +2237,12 @@ async def match(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    raw = await fetch_html(path, ttl=ttl)
-    data = parse_match_list(raw, hint)
+    data, source_path, mode, _hint, _ttl = await fetch_match_list_data(canonical, q_norm)
     data["segments"] = filter_segments_for_request(list(data.get("segments") or []), q_norm)
     data["count"] = len(data["segments"])
     data["game"] = canonical
-    data["source_path"] = path
-    data["render_mode"] = response_mode(raw)
+    data["source_path"] = source_path
+    data["render_mode"] = mode
     return {"status": "success", "data": data}
 
 
@@ -1937,14 +2254,12 @@ async def match_all(
     out: Dict[str, Any] = {}
     for canonical in CANONICAL_GAMES:
         try:
-            path, hint, ttl = match_list_path(canonical, q_norm)
-            raw = await fetch_html(path, ttl=ttl)
-            parsed = parse_match_list(raw, hint)
+            parsed, source_path, mode, _hint, _ttl = await fetch_match_list_data(canonical, q_norm)
             parsed["segments"] = filter_segments_for_request(list(parsed.get("segments") or []), q_norm)
             parsed["count"] = len(parsed["segments"])
             parsed["game"] = canonical
-            parsed["source_path"] = path
-            parsed["render_mode"] = response_mode(raw)
+            parsed["source_path"] = source_path
+            parsed["render_mode"] = mode
             out[canonical] = parsed
         except Exception as exc:
             out[canonical] = {"status": 502, "segments": [], "count": 0, "error": str(exc)}
@@ -2026,9 +2341,8 @@ async def search(
 ) -> Dict[str, Any]:
     source_norm = source.lower().strip()
     canonical = normalize_game(game)
-    path, hint, _ttl = match_list_path(canonical, "current" if source_norm in {"current", "live", "upcoming", "schedule"} else "finished")
-    raw = await fetch_html(path, ttl=30)
-    data = parse_match_list(raw, hint, include_unscored_finished=True)
+    list_q = "current" if source_norm in {"current", "live", "upcoming", "schedule"} else "finished"
+    data, path, _mode, hint, _ttl = await fetch_match_list_data(canonical, list_q, include_unscored_finished=True)
     if source_norm in {"finished", "results"}:
         # Search should be able to find finished-page candidates even when the
         # score is only available after opening the detail page.
